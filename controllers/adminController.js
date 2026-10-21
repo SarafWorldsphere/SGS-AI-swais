@@ -1,5 +1,4 @@
 import model from '../config/aiConfig.js';
-import pool from "../config/db.js";
 import { logAIUsage } from '../utils/aiTracker.js';
 
 // Google Cloud Voice Mapping & Supported Dictionary
@@ -21,10 +20,8 @@ const cleanAIText = (text) => {
     return text
         .replace(/\$\$/g, "")
         .replace(/\$/g, "")
-        .replace(/\\\(/g, "")
-        .replace(/\\\)/g, "")
-        .replace(/\\\[/g, "")
-        .replace(/\\\]/g, "")
+        .replace(/\\\(/g, "") .replace(/\\\)/g, "")
+        .replace(/\\\[/g, "") .replace(/\\\]/g, "")
         .replace(/```json/gi, "")
         .replace(/```/g, "")
         .trim();
@@ -59,14 +56,16 @@ export const translateAdminText = async (req, res) => {
         let prompt = "";
         const usageLabel = isBatch ? `Admin Batch Translator (${targetLanguage})` : `Admin Translator (${targetLanguage})`;
 
+        // ✅ SAAS FIX: Removed hardcoded "SGS" brand from prompts
         if (isBatch) {
             prompt = `
-You are the SGS AI Translator for the School Administrator.
+You are the AI Translator for the School Administrator.
 Translate the following JSON array of names, titles, or notices into ${targetLanguage}.
 
 Requirements:
 - Return ONLY a valid JSON array of strings containing the translations, in the EXACT same order.
-- For names (students/teachers), transliterate them so they sound the same in ${targetLanguage}.
+- For names (students/teachers), transliterate them so they sound the same in 
+${targetLanguage}.
 - Preserve dates and formatting.
 - Do not explain the translation.
 - Do not use Markdown outside of the JSON block.
@@ -76,12 +75,13 @@ ${JSON.stringify(text)}
 `;
         } else {
             prompt = `
-You are the SGS AI Translator for the School Administrator.
+You are the AI Translator for the School Administrator.
 Translate the following name, title, or notice into ${targetLanguage}.
 
 Requirements:
 - Return ONLY the translated text.
-- If it is a person's name, transliterate it accurately so it sounds the same in ${targetLanguage}.
+- If it is a person's name, transliterate it accurately so it sounds the same in 
+${targetLanguage}.
 - Preserve dates and formatting.
 - Do not explain the translation.
 - Do not use Markdown, HTML, or LaTeX.
@@ -93,7 +93,7 @@ Text to translate:
 
         const aiResult = await model.generateContent(prompt);
         
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Admin Dashboard", 
@@ -141,8 +141,9 @@ export const formatVoiceTranscription = async (req, res) => {
     }
 
     try {
+        // ✅ SAAS FIX: Removed hardcoded "SGS" brand
         const prompt = `
-You are the SGS AI Assistant for the School Administrator. 
+You are the AI Assistant for the School Administrator. 
 Take the following raw, unformatted speech-to-text transcription and format it into clean, professional administrative text with proper punctuation and capitalization. 
 
 Requirements
@@ -156,7 +157,7 @@ Raw Audio Text:
 
         const aiResult = await model.generateContent(prompt);
         
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Admin Dashboard", 

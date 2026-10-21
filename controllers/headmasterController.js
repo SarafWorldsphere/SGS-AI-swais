@@ -1,15 +1,14 @@
 import { logAIUsage } from '../utils/aiTracker.js';
 import model from '../config/aiConfig.js';
-import pool from "../config/db.js";
+// ✅ 1. Import withClient instead of raw pool
+import { withClient } from "../config/db.js";
 
 const cleanAIText = (text) => {
     return text
         .replace(/\$\$/g, "")
         .replace(/\$/g, "")
-        .replace(/\\\(/g, "")
-        .replace(/\\\)/g, "")
-        .replace(/\\\[/g, "")
-        .replace(/\\\]/g, "")
+        .replace(/\\\(/g, "") .replace(/\\\)/g, "")
+        .replace(/\\\[/g, "") .replace(/\\\]/g, "")
         .replace(/```json/gi, "")
         .replace(/```/g, "")
         .trim();
@@ -21,13 +20,16 @@ const cleanAIText = (text) => {
 export const getAssignmentReport = async (req, res) => {
     const { userInfo } = req.body;
     try {
-        const dbResult = await pool.query(`
-            SELECT 
-                COUNT(*) AS total_assigned,
-                SUM(CASE WHEN marks_obtained IS NOT NULL THEN 1 ELSE 0 END) AS completed,
-                SUM(CASE WHEN marks_obtained IS NULL OR is_absent = true THEN 1 ELSE 0 END) AS missing
-            FROM sgs_assessment_results;
-        `);
+        // ✅ 2. Wrap query in withClient and remove sgs_ prefix
+        const dbResult = await withClient(req, async (client) => {
+            return await client.query(`
+                SELECT 
+                    COUNT(*) AS total_assigned,
+                    SUM(CASE WHEN marks_obtained IS NOT NULL THEN 1 ELSE 0 END) AS completed,
+                    SUM(CASE WHEN marks_obtained IS NULL OR is_absent = true THEN 1 ELSE 0 END) AS missing
+                FROM assessment_results;
+            `);
+        });
 
         let reportData = dbResult.rows[0];
 
@@ -35,8 +37,9 @@ export const getAssignmentReport = async (req, res) => {
             reportData = { total_assigned: 1200, completed: 950, missing: 250 };
         }
 
+        // ✅ 3. Removed hardcoded 'SGS' brand
         const prompt = `
-You are SGS AI Executive Assistant for the Headmaster.
+You are an AI Executive Assistant for the Headmaster.
 Review the following school-wide assignment statistics.
 
 School Data
@@ -44,9 +47,9 @@ ${JSON.stringify(reportData)}
 
 Prepare a concise executive report.
 Include:
-• Overall completion status.
-• Key concerns requiring intervention.
-• Recommended administrative action.
+- Overall completion status.
+- Key concerns requiring intervention.
+- Recommended administrative action.
 
 IMPORTANT FORMAT RULES
 - Maximum 3 bullet points.
@@ -79,26 +82,30 @@ export const getWeeklyTestReports = async (req, res) => {
         // Calculate interval string for PostgreSQL
         const days = period === "4-week" ? 28 : 14;
 
-        const dbResult = await pool.query(`
-            SELECT
-                a.assessment_type AS subject,
-                a.title AS test_name,
-                a.assessment_date,
-                ar.marks_obtained,
-                12.5 AS total_marks_per_test
-            FROM sgs_assessment_results ar
-            JOIN sgs_assessments a ON a.assessment_id = ar.assessment_id
-            JOIN sgs_student_master s ON s.student_id = ar.student_id
-            WHERE s.full_name ILIKE $1
-              AND a.assessment_category ILIKE '%Weekly%'
-              AND a.assessment_date >= CURRENT_DATE - INTERVAL '${days} days'
-            ORDER BY a.assessment_date DESC;
-        `, [`%${studentName}%`]);
+        // ✅ 4. Wrap query in withClient and remove sgs_ prefixes
+        const dbResult = await withClient(req, async (client) => {
+            return await client.query(`
+                SELECT
+                    a.assessment_type AS subject,
+                    a.title AS test_name,
+                    a.assessment_date,
+                    ar.marks_obtained,
+                    12.5 AS total_marks_per_test
+                FROM assessment_results ar
+                JOIN assessments a ON a.assessment_id = ar.assessment_id
+                JOIN student_master s ON s.student_id = ar.student_id
+                WHERE s.full_name ILIKE $1
+                  AND a.assessment_category ILIKE '%Weekly%'
+                  AND a.assessment_date >= CURRENT_DATE - INTERVAL '${days} days'
+                ORDER BY a.assessment_date DESC;
+            `, [`%${studentName}%`]);
+        });
 
         const testData = dbResult.rows;
 
+        // ✅ 5. Removed hardcoded 'SGS' brand
         const prompt = `
-You are the SGS AI Academic Analyst.
+You are an AI Academic Analyst.
 Analyze the following Weekly Test data for a student over a ${period} period. 
 Note: Each test carries exactly 12.5 marks.
 
@@ -149,54 +156,58 @@ export const getAcademicAnalytics = async (req, res) => {
     const { targetName, targetType, scope, userInfo } = req.body; 
     
     try {
-        let mockData = [];
         let promptContext = "";
+        
+        // ✅ 6. Wrap all conditions in a single withClient and remove sgs_ prefixes
+        const mockData = await withClient(req, async (client) => {
+            if (targetType === 'student' && scope === 'single_subject') {
+                const dbRes = await client.query(`
+                    SELECT a.title AS test, ar.percentage AS score 
+                    FROM assessment_results ar 
+                    JOIN assessments a ON ar.assessment_id = a.assessment_id 
+                    JOIN student_master s ON ar.student_id = s.student_id 
+                    WHERE s.full_name ILIKE $1 LIMIT 5;
+                `, [`%${targetName}%`]);
+                promptContext = `Analyze the performance of student ${targetName} in their recent subjects.`;
+                return dbRes.rows.length ? dbRes.rows : [{ test: "Term 1", score: 85 }];
+                
+            } else if (targetType === 'student' && scope === 'all_subjects') {
+                const dbRes = await client.query(`
+                    SELECT a.assessment_type AS subject, ROUND(AVG(ar.percentage), 2) AS score 
+                    FROM assessment_results ar 
+                    JOIN assessments a ON ar.assessment_id = a.assessment_id 
+                    JOIN student_master s ON ar.student_id = s.student_id 
+                    WHERE s.full_name ILIKE $1 GROUP BY a.assessment_type;
+                `, [`%${targetName}%`]);
+                promptContext = `Analyze the overall performance of student ${targetName} across ALL subjects.`;
+                return dbRes.rows.length ? dbRes.rows : [{ subject: "Math", score: 85 }];
+                
+            } else if (targetType === 'class' && scope === 'single_subject') {
+                const dbRes = await client.query(`
+                    SELECT s.full_name AS student, ar.percentage AS score 
+                    FROM assessment_results ar 
+                    JOIN student_master s ON ar.student_id = s.student_id 
+                    LIMIT 5;
+                `);
+                promptContext = `Analyze the performance of class ${targetName}. Identify struggling students.`;
+                return dbRes.rows.length ? dbRes.rows : [{ student: "Aarav", score: 85 }];
+                
+            } else if (targetType === 'class' && scope === 'all_subjects') {
+                const dbRes = await client.query(`
+                    SELECT a.assessment_type AS subject, ROUND(AVG(ar.percentage), 2) AS avg_score 
+                    FROM assessment_results ar 
+                    JOIN assessments a ON ar.assessment_id = a.assessment_id 
+                    GROUP BY a.assessment_type;
+                `);
+                promptContext = `Analyze the overall cohort performance of class ${targetName} across ALL subjects.`;
+                return dbRes.rows.length ? dbRes.rows : [{ term: "Term 1", avg: 75 }];
+            }
+            return [];
+        });
 
-        if (targetType === 'student' && scope === 'single_subject') {
-            const dbRes = await pool.query(`
-                SELECT a.title AS test, ar.percentage AS score 
-                FROM sgs_assessment_results ar 
-                JOIN sgs_assessments a ON ar.assessment_id = a.assessment_id 
-                JOIN sgs_student_master s ON ar.student_id = s.student_id 
-                WHERE s.full_name ILIKE $1 LIMIT 5;
-            `, [`%${targetName}%`]);
-            mockData = dbRes.rows.length ? dbRes.rows : [{ test: "Term 1", score: 85 }];
-            promptContext = `Analyze the performance of student ${targetName} in their recent subjects.`;
-            
-        } else if (targetType === 'student' && scope === 'all_subjects') {
-            const dbRes = await pool.query(`
-                SELECT a.assessment_type AS subject, ROUND(AVG(ar.percentage), 2) AS score 
-                FROM sgs_assessment_results ar 
-                JOIN sgs_assessments a ON ar.assessment_id = a.assessment_id 
-                JOIN sgs_student_master s ON ar.student_id = s.student_id 
-                WHERE s.full_name ILIKE $1 GROUP BY a.assessment_type;
-            `, [`%${targetName}%`]);
-            mockData = dbRes.rows.length ? dbRes.rows : [{ subject: "Math", score: 85 }];
-            promptContext = `Analyze the overall performance of student ${targetName} across ALL subjects.`;
-            
-        } else if (targetType === 'class' && scope === 'single_subject') {
-            const dbRes = await pool.query(`
-                SELECT s.full_name AS student, ar.percentage AS score 
-                FROM sgs_assessment_results ar 
-                JOIN sgs_student_master s ON ar.student_id = s.student_id 
-                LIMIT 5;
-            `);
-            mockData = dbRes.rows.length ? dbRes.rows : [{ student: "Aarav", score: 85 }];
-            promptContext = `Analyze the performance of class ${targetName}. Identify struggling students.`;
-            
-        } else if (targetType === 'class' && scope === 'all_subjects') {
-            const dbRes = await pool.query(`
-                SELECT a.assessment_type AS subject, ROUND(AVG(ar.percentage), 2) AS avg_score 
-                FROM sgs_assessment_results ar 
-                JOIN sgs_assessments a ON ar.assessment_id = a.assessment_id 
-                GROUP BY a.assessment_type;
-            `);
-            mockData = dbRes.rows.length ? dbRes.rows : [{ term: "Term 1", avg: 75 }];
-            promptContext = `Analyze the overall cohort performance of class ${targetName} across ALL subjects.`;
-        }
-
+        // ✅ 7. Removed hardcoded 'SGS' brand
         const prompt = `
-You are SGS AI Academic Analytics Assistant.
+You are an AI Academic Analytics Assistant.
 ${promptContext}
 
 Academic Data
@@ -204,10 +215,10 @@ ${JSON.stringify(mockData)}
 
 Generate an executive academic report.
 Include:
-• Overall academic trend.
-• Key strengths.
-• Areas requiring intervention.
-• Recommendations for school leadership.
+- Overall academic trend.
+- Key strengths.
+- Areas requiring intervention.
+- Recommendations for school leadership.
 
 IMPORTANT FORMAT RULES
 - Maximum 4 bullet points.
@@ -217,7 +228,9 @@ IMPORTANT FORMAT RULES
         const aiResult = await model.generateContent(prompt);
 
         await logAIUsage(
-            userInfo, "Headmaster Dashboard", `Academic Analytics (${targetType} - ${scope})`, 
+            userInfo, 
+            "Headmaster Dashboard", 
+            `Academic Analytics (${targetType} ${scope})`, 
             aiResult.usageMetadata || aiResult.response?.usageMetadata
         );
 
@@ -234,19 +247,21 @@ IMPORTANT FORMAT RULES
 export const getTeacherPerformance = async (req, res) => {
     const { userInfo } = req.body;
     try {
-        // 🔥 Live Database Query: Tracks Assessments Created + Student Outcomes (Average Score)
-        const dbResult = await pool.query(`
-            SELECT 
-                u.full_name AS name, 
-                COUNT(DISTINCT a.assessment_id) AS assessments_created,
-                ROUND(AVG(ar.percentage), 2) AS average_student_score
-            FROM sgs_users_masters u
-            LEFT JOIN sgs_assessments a ON u.user_id::text = a.teacher_id
-            LEFT JOIN sgs_assessment_results ar ON a.assessment_id = ar.assessment_id
-            WHERE u.role_id = 2 OR u.full_name ILIKE '%Teacher%'
-            GROUP BY u.full_name
-            ORDER BY average_student_score DESC NULLS LAST;
-        `);
+        // ✅ 8. Wrap query in withClient and remove sgs_ prefixes
+        const dbResult = await withClient(req, async (client) => {
+            return await client.query(`
+                SELECT 
+                    u.full_name AS name, 
+                    COUNT(DISTINCT a.assessment_id) AS assessments_created,
+                    ROUND(AVG(ar.percentage), 2) AS average_student_score
+                FROM users_masters u
+                LEFT JOIN assessments a ON u.user_id::text = a.teacher_id
+                LEFT JOIN assessment_results ar ON a.assessment_id = ar.assessment_id
+                WHERE u.role_id = 2 OR u.full_name ILIKE '%Teacher%'
+                GROUP BY u.full_name
+                ORDER BY average_student_score DESC NULLS LAST;
+            `);
+        });
 
         let teacherData = dbResult.rows;
 
@@ -257,8 +272,9 @@ export const getTeacherPerformance = async (req, res) => {
             ];
         }
 
+        // ✅ 9. Removed hardcoded 'SGS' brand
         const prompt = `
-You are SGS AI School Performance Advisor.
+You are an AI School Performance Advisor.
 
 Review the following teacher performance metrics:
 ${JSON.stringify(teacherData)}
@@ -269,9 +285,9 @@ Evaluate the teachers based on these standard evaluation criteria:
 3. Academic Consistency.
 
 Generate a Headmaster Executive Summary containing:
-• Top performing faculty members based on criteria.
-• Teachers requiring support or intervention.
-• Suggested professional development steps.
+- Top performing faculty members based on criteria.
+- Teachers requiring support or intervention.
+- Suggested professional development steps.
 
 IMPORTANT FORMAT RULES
 - Maximum 4 bullet points.

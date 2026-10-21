@@ -8,8 +8,9 @@ from pydantic import BaseModel
 from typing import Union, List, Optional
 
 from config.ai_config import model
-from config.db import pool
 from config.languages import SUPPORTED_LANGUAGES
+# NOTE: 'pool' is no longer imported globally here. 
+# The database connection must be injected from the FastAPI router using saraswati_tenant.
 
 # ==========================================================
 # Pydantic Schemas (For Auto-Validation & Swagger UI)
@@ -26,9 +27,10 @@ class VoiceFormatRequest(BaseModel):
 # ==========================================================
 # Helper Function: Log AI Usage & Tokens
 # ==========================================================
-async def log_ai_usage(user_info, module_name, feature_name, usage_metadata=None):
-    email = user_info.get("email", "admin@sgs.edu") if user_info else "admin@sgs.edu"
-    client_name = os.getenv("CLIENT_NAME", "SGS")
+async def log_ai_usage(user_info, module_name, feature_name, usage_metadata=None, db_connection=None):
+    # Removed hardcoded SGS fallback values
+    email = user_info.get("email", "admin@school.local") if user_info else "admin@school.local"
+    client_name = os.getenv("CLIENT_NAME", "School")
     
     prompt_tokens = getattr(usage_metadata, "prompt_token_count", 0) if usage_metadata else 0
     completion_tokens = getattr(usage_metadata, "candidates_token_count", 0) if usage_metadata else 0
@@ -37,16 +39,21 @@ async def log_ai_usage(user_info, module_name, feature_name, usage_metadata=None
     ist = timezone(timedelta(hours=5, minutes=30))
     ist_time = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
+    if not db_connection:
+        print("🚨 Warning: No database connection provided to log_ai_usage.")
+        return
+
     try:
-        await pool.execute(
+        # Removed sgs_ prefix; using the injected, tenant-scoped db_connection
+        await db_connection.execute(
             """
-            INSERT INTO sgs_ai_usage_logs
+            INSERT INTO ai_usage_logs
             (client_name, user_email, module_name, feature_used, prompt_tokens, completion_tokens, total_tokens, created_at_ist)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
             client_name, email, module_name, feature_name, prompt_tokens, completion_tokens, total_tokens, ist_time
         )
-        print(f"[LOG] {client_name} - {module_name} -> {feature_name} used by {email} | Tokens: {total_tokens}")
+        print(f"[LOG] {client_name} | {module_name} -> {feature_name} used by {email} | Tokens: {total_tokens}")
     except Exception as e:
         print("🚨 Failed to log AI usage to database:", e)
 
@@ -70,8 +77,7 @@ def clean_ai_text(text: str):
 # ==========================================================
 # 1. ADMIN TRANSLATOR
 # ==========================================================
-async def translate_admin_text(payload: TranslateRequest):
-    # Data is automatically extracted and validated by Pydantic!
+async def translate_admin_text(payload: TranslateRequest, db_connection=None):
     text_data = payload.text
     target_language = payload.targetLanguage
     user_info = payload.userInfo
@@ -90,13 +96,15 @@ async def translate_admin_text(payload: TranslateRequest):
         is_batch = isinstance(text_data, list)
         usage_label = f"Admin Batch Translator ({target_language})" if is_batch else f"Admin Translator ({target_language})"
 
+        # Removed hardcoded SGS branding
         if is_batch:
             prompt = f"""
-You are the SGS AI Translator for the School Administrator.
+You are the AI Translator for the School Administrator.
 Translate the following JSON array of names, titles, or notices into {target_language}.
 Requirements:
 - Return ONLY a valid JSON array of strings containing the translations, in the EXACT same order.
-- For names (students/teachers), transliterate them so they sound the same in {target_language}.
+- For names (students/teachers), transliterate them so they sound the same in 
+{target_language}.
 - Preserve dates and formatting.
 - Do not explain the translation.
 - Do not use Markdown outside of the JSON block.
@@ -106,11 +114,12 @@ List to translate:
 """
         else:
             prompt = f"""
-You are the SGS AI Translator for the School Administrator.
+You are the AI Translator for the School Administrator.
 Translate the following name, title, or notice into {target_language}.
 Requirements:
 - Return ONLY the translated text.
-- If it is a person's name, transliterate it accurately so it sounds the same in {target_language}.
+- If it is a person's name, transliterate it accurately so it sounds the same in 
+{target_language}.
 - Preserve dates and formatting.
 - Do not explain the translation.
 - Do not use Markdown, HTML, or LaTeX.
@@ -126,7 +135,8 @@ Text to translate:
             user_info, 
             "Admin Dashboard", 
             usage_label, 
-            getattr(ai_result, "usage_metadata", None)
+            getattr(ai_result, "usage_metadata", None),
+            db_connection
         )
 
         if is_batch:
@@ -156,14 +166,14 @@ Text to translate:
 # ==========================================================
 # 2. VOICE FORMATTER 
 # ==========================================================
-async def format_voice_transcription(payload: VoiceFormatRequest):
-    # Data is automatically extracted and validated by Pydantic!
+async def format_voice_transcription(payload: VoiceFormatRequest, db_connection=None):
     raw_transcription = payload.rawTranscription
     user_info = payload.userInfo
 
     try:
+        # Removed hardcoded SGS branding
         prompt = f"""
-You are the SGS AI Assistant for the School Administrator.
+You are the AI Assistant for the School Administrator.
 Take the following raw speech-to-text transcription and convert it into accurate text.
 Note: This could be a short search query (like a student's name) or administrative dictation.
 
@@ -186,7 +196,8 @@ Raw Audio Text:
             user_info, 
             "Admin Dashboard", 
             "Admin Voice-to-Text Formatting", 
-            getattr(ai_result, "usage_metadata", None)
+            getattr(ai_result, "usage_metadata", None),
+            db_connection
         )
 
         return JSONResponse({

@@ -1,6 +1,7 @@
 import { logAIUsage } from '../utils/aiTracker.js';
 import model from '../config/aiConfig.js';
-import pool from "../config/db.js";
+// ✅ 1. Import withClient instead of raw pool
+import { withClient } from "../config/db.js";
 import textToSpeech from '@google-cloud/text-to-speech'; // REQUIRED FOR GOOGLE TTS
 
 // Google Cloud TTS Client Initialize using your API KEY from .env
@@ -29,46 +30,51 @@ export const getAssignmentReport = async (req, res) => {
     const parentId = userInfo?.id || 1;
 
     try {
-        // 🔥 Live Database Query using Parent-Student Mapping
-        const dbResult = await pool.query(`
-            SELECT a.assessment_type AS subject, a.title AS task, a.assessment_date AS due,
-                   CASE WHEN ar.is_absent = true OR ar.marks_obtained IS NULL THEN 'Missing' ELSE 'Completed' END AS status,
-                   ar.percentage AS grade
-            FROM sgs_assessment_results ar
-            JOIN sgs_assessments a ON ar.assessment_id = a.assessment_id
-            JOIN sgs_parent_student_map psm ON ar.student_id = psm.student_id
-            WHERE psm.parent_id = $1
-            ORDER BY a.assessment_date DESC
-            LIMIT 5;
-        `, [parentId]);
+        // ✅ 2. Wrap queries inside withClient and remove sgs_ prefixes
+        const assignments = await withClient(req, async (client) => {
+            const dbResult = await client.query(`
+                SELECT a.assessment_type AS subject, a.title AS task, a.assessment_date AS due,
+                       CASE WHEN ar.is_absent = true OR ar.marks_obtained IS NULL THEN 'Missing' ELSE 'Completed' END AS status,
+                       ar.percentage AS grade
+                FROM assessment_results ar
+                JOIN assessments a ON ar.assessment_id = a.assessment_id
+                JOIN parent_student_map psm ON ar.student_id = psm.student_id
+                WHERE psm.parent_id = $1
+                ORDER BY a.assessment_date DESC
+                LIMIT 5;
+            `, [parentId]);
 
-        let assignments = dbResult.rows;
+            return dbResult.rows;
+        });
+
+        let finalAssignments = assignments;
 
         // Fallback if DB is empty
-        if (assignments.length === 0) {
-            assignments = [
+        if (finalAssignments.length === 0) {
+            finalAssignments = [
                 { subject: "Math", task: "Algebra Worksheet 3", status: "Completed", grade: "85" },
                 { subject: "Science", task: "Chapter 1 Summary", status: "Pending", due: "Tomorrow" },
                 { subject: "History", task: "Essay Draft", status: "Missing", due: "Last Friday" }
             ];
         }
 
+        // ✅ 3. Removed hardcoded 'SGS' brand
         const prompt = `
-You are SGS AI Parent Assistant.
+You are an AI Parent Assistant.
 
 Review the following assignment information.
 
 Assignment Data
 
-${JSON.stringify(assignments)}
+${JSON.stringify(finalAssignments)}
 
 Generate a concise parent update.
 
 Include:
 
-• Positive progress made by the student.
-• Missing or overdue assignments.
-• Upcoming work requiring attention.
+- Positive progress made by the student.
+- Missing or overdue assignments.
+- Upcoming work requiring attention.
 
 IMPORTANT FORMAT RULES
 
@@ -85,7 +91,7 @@ IMPORTANT FORMAT RULES
 
         const aiResult = await model.generateContent(prompt);
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // ✅ Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Parent Dashboard", 
@@ -93,7 +99,7 @@ IMPORTANT FORMAT RULES
             aiResult.usageMetadata || aiResult.response?.usageMetadata
         );
 
-        res.json({ report: aiResult.text, list: assignments });
+        res.json({ report: aiResult.text, list: finalAssignments });
     } catch (err) {
         console.error("🚨 ASSIGNMENT REPORT CRASH:", err);
         res.status(500).json({ error: "Failed to generate assignment report", details: err.message });
@@ -108,32 +114,31 @@ export const getParentAnalytics = async (req, res) => {
     const parentId = userInfo?.id || 1;
 
     try {
-        let dbResult;
-        let mockData = [];
-
-        // 🔥 Live Database Queries based on scope
-        if (scope === 'single') {
-            dbResult = await pool.query(`
-                SELECT a.title AS test_name, ar.percentage AS score
-                FROM sgs_assessment_results ar
-                JOIN sgs_assessments a ON ar.assessment_id = a.assessment_id
-                JOIN sgs_parent_student_map psm ON ar.student_id = psm.student_id
-                WHERE psm.parent_id = $1 AND a.title ILIKE $2 AND ar.percentage IS NOT NULL
-                ORDER BY a.assessment_date ASC
-                LIMIT 5;
-            `, [parentId, `%${subject}%`]);
-            mockData = dbResult.rows;
-        } else {
-            dbResult = await pool.query(`
-                SELECT a.assessment_type AS subject, ROUND(AVG(ar.percentage), 2) AS score
-                FROM sgs_assessment_results ar
-                JOIN sgs_assessments a ON ar.assessment_id = a.assessment_id
-                JOIN sgs_parent_student_map psm ON ar.student_id = psm.student_id
-                WHERE psm.parent_id = $1 AND ar.percentage IS NOT NULL
-                GROUP BY a.assessment_type;
-            `, [parentId]);
-            mockData = dbResult.rows;
-        }
+        // ✅ 4. Wrap queries inside withClient and remove sgs_ prefixes
+        let mockData = await withClient(req, async (client) => {
+            if (scope === 'single') {
+                const dbResult = await client.query(`
+                    SELECT a.title AS test_name, ar.percentage AS score
+                    FROM assessment_results ar
+                    JOIN assessments a ON ar.assessment_id = a.assessment_id
+                    JOIN parent_student_map psm ON ar.student_id = psm.student_id
+                    WHERE psm.parent_id = $1 AND a.title ILIKE $2 AND ar.percentage IS NOT NULL
+                    ORDER BY a.assessment_date ASC
+                    LIMIT 5;
+                `, [parentId, `%${subject}%`]);
+                return dbResult.rows;
+            } else {
+                const dbResult = await client.query(`
+                    SELECT a.assessment_type AS subject, ROUND(AVG(ar.percentage), 2) AS score
+                    FROM assessment_results ar
+                    JOIN assessments a ON ar.assessment_id = a.assessment_id
+                    JOIN parent_student_map psm ON ar.student_id = psm.student_id
+                    WHERE psm.parent_id = $1 AND ar.percentage IS NOT NULL
+                    GROUP BY a.assessment_type;
+                `, [parentId]);
+                return dbResult.rows;
+            }
+        });
 
         // Fallback for empty DB
         if (mockData.length === 0) {
@@ -146,8 +151,9 @@ export const getParentAnalytics = async (req, res) => {
             ? `Analyze the student's progress in ${subject}.`
             : `Analyze the student's overall academic progress across all subjects.`;
 
+        // ✅ 5. Removed hardcoded 'SGS' brand
         const prompt = `
-You are SGS AI Parent Progress Assistant.
+You are an AI Parent Progress Assistant.
 
 ${promptContext}
 
@@ -159,10 +165,10 @@ Generate a parent-friendly report.
 
 Include
 
-• Overall academic progress.
-• Strongest subject.
-• Subject needing improvement (if any).
-• One practical suggestion for parents to support learning at home.
+- Overall academic progress.
+- Strongest subject.
+- Subject needing improvement (if any).
+- One practical suggestion for parents to support learning at home.
 
 IMPORTANT FORMAT RULES
 
@@ -178,7 +184,7 @@ IMPORTANT FORMAT RULES
 
         const aiResult = await model.generateContent(prompt);
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // ✅ Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Parent Dashboard", 
@@ -191,7 +197,7 @@ IMPORTANT FORMAT RULES
     } catch (err) {
         console.error("🚨 PARENT ANALYTICS CRASH:", err);
         
-        // 🔥 CONTINGENCY: If AI fails, still send the chart data so the UI doesn't crash!
+        // CONTINGENCY: If AI fails, still send chart data so UI doesn't break
         const fallbackData = scope === 'single' 
             ? [ { test_name: "Unit 1", score: 75 }, { test_name: "Midterm", score: 82 }, { test_name: "Unit 2", score: 88 } ]
             : [ { subject: "Math", score: 88 }, { subject: "Science", score: 92 }, { subject: "English", score: 78 }, { subject: "History", score: 85 } ];
@@ -204,7 +210,7 @@ IMPORTANT FORMAT RULES
 };
 
 // ==========================================
-// 4. TRANSLATOR
+// 4. TRANSLATOR (No DB queries - remains identical)
 // ==========================================
 export const translateForParent = async (req, res) => {
     const { text, targetLanguage, userInfo } = req.body;
@@ -232,7 +238,6 @@ School Communication
 
         const aiResult = await model.generateContent(prompt);
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Parent Dashboard", 
@@ -248,10 +253,9 @@ School Communication
 };
 
 // ==========================================
-// 5. GOOGLE CLOUD TEXT-TO-SPEECH (For Parent Notices/Remarks)
+// 5. GOOGLE CLOUD TEXT-TO-SPEECH (No DB queries - remains identical)
 // ==========================================
 export const handleTextToSpeech = async (req, res) => {
-    // ✅ NEW: Added userInfo extraction here
     const { text, language = "English", userInfo } = req.body;
 
     if (!text) {
@@ -270,7 +274,6 @@ export const handleTextToSpeech = async (req, res) => {
         const [response] = await ttsClient.synthesizeSpeech(request);
         const audioBase64 = response.audioContent.toString('base64');
 
-        // ✅ NEW: Log the TTS feature without tokens
         await logAIUsage(userInfo, "Parent Dashboard", "Text-to-Speech (Listen)", null);
 
         res.json({

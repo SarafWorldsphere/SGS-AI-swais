@@ -27,6 +27,24 @@ const PORT = process.env.PORT || 5000;
 app.use(express.json());
 app.use(cors({ origin: '*' }));
 
+// ✅ SAAS MULTI-TENANT MIDDLEWARE
+// Intercepts the request to identify the school by hostname
+app.use((req, res, next) => {
+    const host = req.hostname; // Express automatically strips the port
+    
+    // Map domains to their tenant UUIDs (or slugs)
+    if (host === 'sgs.localhost') {
+        req.headers['x-saraswati-tenant-id'] = 'sgs'; // Update to exact SGS tenant UUID if required by DB
+    } else if (host === 'sss.localhost') {
+        req.headers['x-saraswati-tenant-id'] = 'sss'; // Update to exact SSS tenant UUID if required by DB
+    } else {
+        // Fail closed for unrecognized domains
+        return res.status(404).json({ error: "School not found for this domain." });
+    }
+    
+    next();
+});
+
 // Health Check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'Modular SGS Engine Online', database: 'Ready' });
@@ -40,22 +58,10 @@ app.use('/api/v1/ai/headmaster', headmasterRoutes);
 app.use('/api/v1/ai/admin', adminRoutes);
 
 // 🌟 NEW: MOUNT COMPETITIVE EXAM & COMMUNITY FORUM ROUTES
-// We mount these directly so both Student and Teacher dashboards can hit them!
 app.post('/api/v1/competitive/generate', generateCompetitiveContent);
 app.post('/api/v1/community/doubt', postDoubt);
 app.get('/api/v1/community/doubts', getCommunityDoubts);
 app.post('/api/v1/community/answer', answerDoubt);
-
-// 🔍 DATABASE CONNECTION TEST (COMMENTED OUT TO BYPASS AWS FIREWALL)
-/*
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error("❌ Database Connection Failed:", err.message);
-  } else {
-    console.log("✅ Database Connected Successfully!");
-  }
-});
-*/
 
 app.listen(PORT, () => {
   console.log(`🚀 Modular AI Server running cleanly on port ${PORT}`);

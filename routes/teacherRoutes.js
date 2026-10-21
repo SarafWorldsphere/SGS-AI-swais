@@ -10,11 +10,8 @@ import {
     translateText,
     teacherChatbot,
     processVirtualSlateContent,
-    handleTextToSpeech // 🔊 ADDED THIS IMPORT
+    handleTextToSpeech 
 } from '../controllers/teacherController.js';
-
-import { generateCompetitiveContent } from '../controllers/competitiveController.js';
-import { postDoubt, getCommunityDoubts, answerDoubt } from '../controllers/communityController.js';
 
 const router = express.Router();
 
@@ -37,14 +34,6 @@ router.post('/chat', teacherChatbot);
 router.post('/virtual-slate', processVirtualSlateContent); 
 
 // 5. Speech Services
-router.post('/speak', handleTextToSpeech); // 🔊 ADDED THIS ROUTE
-
-// Competitive Exam Route (Used by both Student and Teacher dashboards)
-router.post('/competitive/generate', generateCompetitiveContent);
-
-// Community Doubt Forum Routes
-router.post('/community/doubt', postDoubt);          // Ask a doubt
-router.get('/community/doubts', getCommunityDoubts); // View all doubts feed
-router.post('/community/answer', answerDoubt);       // Answer a doubt
+router.post('/speak', handleTextToSpeech); 
 
 export default router;

@@ -67,7 +67,6 @@ export const generateCompetitiveContent = async (req, res) => {
         const classNum = parseInt(classNumStr);
         
         // 2. Look up the specific blueprint from the dictionary
-        // Fallback to a generic string if the specific Class + Exam combo isn't mapped yet
         let trackInfo = "Standard Competitive Track: +4 Marks, -1 Negative Marking.";
         if (examBlueprints[classNumStr] && examBlueprints[classNumStr][examTarget]) {
             trackInfo = examBlueprints[classNumStr][examTarget];
@@ -77,13 +76,14 @@ export const generateCompetitiveContent = async (req, res) => {
             trackInfo = "Target Elite Track: Strict national patterns (+4/-1).";
         }
 
+        // ✅ SAAS FIX: Removed hardcoded "SGS Eduhunt" from the prompt constraint
         const classGuardrail = `
 🚨 CRITICAL AGE, SYLLABUS & BLUEPRINT CONSTRAINT 🚨
 Target Exam: ${examTarget}
 Student Class: ${classLevel} (Approx age:${classNum + 5} years old)
 Institutional Track Guidelines: ${trackInfo}
 
-You MUST ONLY use concepts strictly appropriate for a Class ${classLevel} syllabus, adhering to the SGS Eduhunt micro-schedules. 
+You MUST ONLY use concepts strictly appropriate for a Class ${classLevel} syllabus, adhering to the school's micro-schedules. 
 Difficulty Level: ${examDifficulty}.
 `;
 

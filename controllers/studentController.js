@@ -1,6 +1,7 @@
 import { logAIUsage } from '../utils/aiTracker.js';
 import model from '../config/aiConfig.js';
-import pool from "../config/db.js";
+// ✅ 1. Import withClient instead of raw pool
+import { withClient } from "../config/db.js";
 import textToSpeech from '@google-cloud/text-to-speech'; // REQUIRED FOR GOOGLE TTS
 
 // Google Cloud TTS Client Initialize using your API KEY from .env
@@ -33,16 +34,19 @@ export const handleStudentChat = async (req, res) => {
     }
 
     try {
-        // Save student's message
-        await pool.query(
-            `INSERT INTO sgs_ai_chat_messages
-            (student_id, role, message_content, created_at)
-            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
-            [studentId, "user", message]
-        );
+        // ✅ 2. Use withClient and remove sgs_ prefix to save student's message
+        await withClient(req, async (client) => {
+            await client.query(
+                `INSERT INTO ai_chat_messages
+                (student_id, role, message_content, created_at)
+                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+                [studentId, "user", message]
+            );
+        });
 
+        // ✅ 3. Removed hardcoded 'SGS' brand from the prompt
         const prompt = `
-You are SGS AI, a supportive, encouraging AI tutor for school students.
+You are an AI, a supportive, encouraging AI tutor for school students.
 
 INSTRUCTION ON LANGUAGE:
 1. If the student explicitly asks to explain or speak in a specific language, answer entirely in that language.
@@ -77,7 +81,7 @@ Student's message:
         const aiResult = await model.generateContent(prompt);
         const aiReply = aiResult.text;
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes to capture tokens
+        // Log AI Usage AFTER Gemini finishes to capture tokens
         await logAIUsage(
             userInfo, 
             "Student Dashboard", 
@@ -85,13 +89,15 @@ Student's message:
             aiResult.usageMetadata || aiResult.response?.usageMetadata 
         );
 
-        // Save AI reply
-        await pool.query(
-            `INSERT INTO sgs_ai_chat_messages
-            (student_id, role, message_content, created_at)
-            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
-            [studentId, "ai", aiReply]
-        );
+        // ✅ 4. Use withClient again for saving the AI reply (done separately to avoid locking DB during API wait)
+        await withClient(req, async (client) => {
+            await client.query(
+                `INSERT INTO ai_chat_messages
+                (student_id, role, message_content, created_at)
+                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+                [studentId, "ai", aiReply]
+            );
+        });
 
         res.json({
             reply: aiReply,
@@ -118,12 +124,15 @@ export const generateAutoQuiz = async (req, res) => {
     }
 
     try {
-        const result = await pool.query(
-            `SELECT full_text_content
-             FROM sgs_chapter_content
-             WHERE chapter_id = $1`,
-            [chapterId]
-        );
+        // ✅ 5. Wrap query in withClient and remove sgs_ prefix
+        const result = await withClient(req, async (client) => {
+            return await client.query(
+                `SELECT full_text_content
+                 FROM chapter_content
+                 WHERE chapter_id = $1`,
+                [chapterId]
+            );
+        });
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Chapter content not found in database" });
@@ -164,7 +173,7 @@ Chapter:
 
         const aiResult = await model.generateContent(prompt);
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Student Dashboard", 
@@ -198,21 +207,24 @@ export const getStudentAnalytics = async (req, res) => {
     const studentId = userInfo?.id || 1;
 
     try {
-        const gradesResult = await pool.query(
-            `
-            SELECT
-                a.title AS test_name,
-                ar.percentage AS score
-            FROM sgs_assessment_results ar
-            JOIN sgs_assessments a
-                ON ar.assessment_id = a.assessment_id
-            WHERE ar.student_id = $1
-            AND ar.percentage IS NOT NULL
-            ORDER BY a.assessment_date ASC
-            LIMIT 10;
-            `,
-            [studentId]
-        );
+        // ✅ 6. Wrap query in withClient and remove sgs_ prefix
+        const gradesResult = await withClient(req, async (client) => {
+            return await client.query(
+                `
+                SELECT
+                    a.title AS test_name,
+                    ar.percentage AS score
+                FROM assessment_results ar
+                JOIN assessments a
+                    ON ar.assessment_id = a.assessment_id
+                WHERE ar.student_id = $1
+                AND ar.percentage IS NOT NULL
+                ORDER BY a.assessment_date ASC
+                LIMIT 10;
+                `,
+                [studentId]
+            );
+        });
 
         let grades = gradesResult.rows;
 
@@ -250,7 +262,7 @@ ${JSON.stringify(grades)}
 
         const aiResult = await model.generateContent(prompt);
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Student Dashboard", 
@@ -284,12 +296,15 @@ export const generatePacedContent = async (req, res) => {
     }
 
     try {
-        const result = await pool.query(
-            `SELECT full_text_content
-             FROM sgs_chapter_content
-             WHERE chapter_id = $1`,
-            [chapterId]
-        );
+        // ✅ 7. Wrap query in withClient and remove sgs_ prefix
+        const result = await withClient(req, async (client) => {
+            return await client.query(
+                `SELECT full_text_content
+                 FROM chapter_content
+                 WHERE chapter_id = $1`,
+                [chapterId]
+            );
+        });
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "Chapter not found" });
@@ -336,7 +351,7 @@ Wrong:
 
         const aiResult = await model.generateContent(prompt);
 
-        // ✅ NEW: Log AI Usage AFTER Gemini finishes
+        // Log AI Usage AFTER Gemini finishes
         await logAIUsage(
             userInfo, 
             "Student Dashboard", 
@@ -358,7 +373,7 @@ Wrong:
 };
 
 // ==========================================
-// 5. GOOGLE CLOUD TEXT-TO-SPEECH CONTROLLER
+// 5. GOOGLE CLOUD TEXT-TO-SPEECH CONTROLLER (Remains Identical)
 // ==========================================
 export const handleTextToSpeech = async (req, res) => {
     const { text, language = "English", userInfo } = req.body;
@@ -379,7 +394,7 @@ export const handleTextToSpeech = async (req, res) => {
         const [response] = await ttsClient.synthesizeSpeech(request);
         const audioBase64 = response.audioContent.toString('base64');
 
-        // ✅ NEW: Log the TTS feature. It doesn't use Gemini tokens, so we omit the token parameter!
+        // Log the TTS feature. It doesn't use Gemini tokens, so we omit the token parameter!
         await logAIUsage(userInfo, "Student Dashboard", "Text-to-Speech (Listen)", null);
 
         res.json({

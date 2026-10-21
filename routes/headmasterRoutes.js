@@ -1,6 +1,7 @@
 import express from 'express';
 import { 
-    getAssignmentReport, 
+    getAssignmentReport,
+    getWeeklyTestReports, // ✅ Added missing import
     getAcademicAnalytics, 
     getTeacherPerformance, 
     translateForHeadmaster 
@@ -10,9 +11,10 @@ const router = express.Router();
 
 // 👨‍🏫 Headmaster Dashboard Routes
 // ALL changed to POST to support DB Usage Logging via req.body.userInfo
-router.post('/assignment-report', getAssignmentReport); // Task 1
-router.post('/academic-analytics', getAcademicAnalytics); // Tasks 2, 3, 4, 5
-router.post('/teacher-performance', getTeacherPerformance); // Task 6
-router.post('/translate', translateForHeadmaster); // Task 8
+router.post('/assignment-report', getAssignmentReport); 
+router.post('/weekly-test-report', getWeeklyTestReports); // ✅ Added missing route
+router.post('/academic-analytics', getAcademicAnalytics); 
+router.post('/teacher-performance', getTeacherPerformance); 
+router.post('/translate', translateForHeadmaster); 
 
 export default router;
