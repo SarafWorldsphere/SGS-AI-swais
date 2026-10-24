@@ -14,10 +14,8 @@ const pool = new Pool({
   port: parseInt(process.env.DB_PORT),
   max: 5,
 
-  // ✅ SSL ADDED: AWS RDS strictly requires encrypted connections
-  ssl: {
-    rejectUnauthorized: false
-  },
+  // ❌ SSL DISABLED: Local PostgreSQL development does not support/need SSL
+  ssl: false,
   
   // ✅ Stability settings to prevent timeouts on big AI requests
   connectionTimeoutMillis: 15000, 
@@ -38,8 +36,8 @@ const TENANT_HEADER = "x-saraswati-tenant-id";
  * Binds the PostgreSQL connection session to a specific school (tenant).
  * This function enforces Row-Level Security (RLS) so queries only see one school's data.
  * 
- * @param {PoolClient} client - The active database client
- * @param {Request} req - The Express request object containing the tenant header
+ * @param {PoolClient} client The active database client
+ * @param {Request} req The Express request object containing the tenant header
  */
 async function bindTenant(client, req) {
   const tenantId = req.headers[TENANT_HEADER];
@@ -67,8 +65,8 @@ async function bindTenant(client, req) {
  *   return res.rows;
  * });
  * 
- * @param {Request} req - The Express request object
- * @param {Function} callback - The function containing your actual SQL queries
+ * @param {Request} req The Express request object
+ * @param {Function} callback The function containing your actual SQL queries
  */
 export async function withClient(req, callback) {
   const client = await pool.connect();
