@@ -118,6 +118,16 @@ REQUIRED JSON STRUCTURE:
 };
 
 // ==========================================
+// 🌍 PERIODICAL EXAM BLUEPRINT DICTIONARY
+// ==========================================
+const periodicalBlueprints = {
+    "PT1": "PT1/PT3 Pattern (50 Marks): Ensure a distribution covering Section A: MCQs (10 Marks). Section B: Fill in the blanks / True False (5 Marks). Section C: Short Answer Questions (10 Marks). Section D: Long Answer Questions (10-12 Marks). Section E: Case Study / Diagram based questions (5-8 Marks).",
+    "PT3": "PT1/PT3 Pattern (50 Marks): Ensure a distribution covering Section A: MCQs (10 Marks). Section B: Fill in the blanks / True False (5 Marks). Section C: Short Answer Questions (10 Marks). Section D: Long Answer Questions (10-12 Marks). Section E: Case Study / Diagram based questions (5-8 Marks).",
+    "PT2": "PT2/PT4 Pattern (80 Marks): Ensure a distribution covering Section A: MCQs (10-20 Marks). Section B: Objective (Fill in the blanks, True/False, Matching) (15 Marks). Section C: Very Short Answer / One Word (5-10 Marks). Section D: Short Answer (10-18 Marks). Section E: Long Answer (20 Marks). Section F: Case Study / Picture Identification / Diagram (10-12 Marks).",
+    "PT4": "PT2/PT4 Pattern (80 Marks): Ensure a distribution covering Section A: MCQs (10-20 Marks). Section B: Objective (Fill in the blanks, True/False, Matching) (15 Marks). Section C: Very Short Answer / One Word (5-10 Marks). Section D: Short Answer (10-18 Marks). Section E: Long Answer (20 Marks). Section F: Case Study / Picture Identification / Diagram (10-12 Marks)."
+};
+
+// ==========================================
 // 2. AUTO QUESTION PAPER GENERATOR (CONSTRAINED & TIERED)
 // ==========================================
 export const generateQuestionPaper = async (req, res) => {
@@ -127,6 +137,7 @@ export const generateQuestionPaper = async (req, res) => {
             chapterId, 
             difficulty = 'Core', 
             taughtTopics = [], 
+            examType = 'Standard', // NEW: PT1, PT2, PT3, PT4, or Standard
             questionType = 'All', 
             totalMarks = 50,
             classLevel = 'Class 8', 
@@ -141,7 +152,7 @@ export const generateQuestionPaper = async (req, res) => {
         const validDifficulties = ['Foundational', 'Core', 'Advanced'];
         const validatedDifficulty = validDifficulties.includes(difficulty) ? difficulty : 'Core';
 
-        // ✅ 4. Wrap query in withClient and remove sgs_ prefix
+        // Wrap query in withClient
         const result = await withClient(req, async (client) => {
             return await client.query(
                 'SELECT chapter_name, full_text_content FROM chapter_content WHERE chapter_id = $1', 
@@ -156,10 +167,18 @@ export const generateQuestionPaper = async (req, res) => {
             ? `CRITICAL: You MUST ONLY generate questions from the following taught topics: ${taughtTopics.join(', ')}. DO NOT generate questions from any other part of the chapter.`
             : `Generate questions from the provided textbook content.`;
 
-        const isSpecificType = questionType && questionType !== 'All';
-        const typeInstruction = isSpecificType 
-            ? `CRITICAL: Generate ONLY "${questionType}" questions. The entire paper MUST consist exclusively of ${questionType} questions.`
-            : `Generate a balanced mix of objective, short answer, and long answer questions.`;
+        // NEW: Determine if a specific PT pattern applies
+        let typeInstruction = "";
+        const isPTExam = periodicalBlueprints.hasOwnProperty(examType);
+
+        if (isPTExam) {
+            typeInstruction = `CRITICAL EXAM BLUEPRINT: You are setting a ${examType} exam. You MUST strictly follow this mark distribution: ${periodicalBlueprints[examType]}`;
+        } else {
+            const isSpecificType = questionType && questionType !== 'All';
+            typeInstruction = isSpecificType 
+                ? `CRITICAL: Generate ONLY "${questionType}" questions. The entire paper MUST consist exclusively of ${questionType} questions.`
+                : `Generate a balanced mix of objective, short answer, and long answer questions.`;
+        }
 
         const prompt = `
 You are an expert school exam paper setter.
@@ -169,6 +188,7 @@ EXAM PARAMETERS:
 Chapter: "${chapter_name}"
 Difficulty Tier: ${validatedDifficulty} (Adjust complexity accordingly)
 Total Marks: ${totalMarks}
+Exam Target: ${examType}
 
 TEXTBOOK CONTENT:
 """
@@ -176,8 +196,7 @@ ${full_text_content}
 """
 
 INSTRUCTIONS:
-1. 
-${topicInstruction}
+1. ${topicInstruction}
 2. The sum of the marks for all questions MUST add up exactly to ${totalMarks}.
 3. ${typeInstruction}
 4. You MUST return STRICTLY a JSON array of objects. Do not include markdown outside the JSON block.
@@ -186,8 +205,8 @@ Ensure the output EXACTLY matches this schema:
 [
   {
     "question": "The question text",
-    "type": "${isSpecificType ? questionType : 'String (e.g., MCQ, Short Answer)'}",
-    "options": ["Option A", "Option B", "Option C", "Option D"], // Provide array of strings for MCQs, otherwise null
+    "type": "String (e.g., MCQ, Short Answer, Case Study, Match the following)",
+    "options": ["Option A", "Option B", "Option C", "Option D"], // Provide array of strings for MCQs/Matching, otherwise null
     "answer": "The correct answer and marking scheme",
     "marks": Number
   }
