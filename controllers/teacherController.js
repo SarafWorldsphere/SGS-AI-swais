@@ -188,7 +188,7 @@ export const generateLessonPlan = async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT chapter_name, full_text_content FROM chapter_content WHERE chapter_id = $1', 
+            'SELECT chapter_name, full_text_content FROM sgs_chapter_content WHERE chapter_id = $1', 
             [chapterId]
         );
 
@@ -281,7 +281,7 @@ export const generateQuestionPaper = async (req, res) => {
         const validatedDifficulty = validDifficulties.includes(difficulty) ? difficulty : 'Core';
 
         const result = await pool.query(
-            'SELECT chapter_name, full_text_content FROM chapter_content WHERE chapter_id = $1', 
+            'SELECT chapter_name, full_text_content FROM sgs_chapter_content WHERE chapter_id = $1', 
             [chapterId]
         );
         
