@@ -310,120 +310,584 @@ REQUIRED JSON STRUCTURE:
     }
 };
 
+// =========================================================================
+// HELPER: RETRIEVE EXAM BLUEPRINT FROM DB (WITH FALLBACK TO DICTIONARY)
+// =========================================================================
+async function getDynamicExamBlueprint(examType, classLevel, subject) {
+    const normExam = (examType || '').toUpperCase().trim();
+    const cleanClass = (classLevel || '').trim();
+    const cleanClassNum = cleanClass.replace(/\D/g, '');
+    const subjectCategory = resolveSubjectCategory(subject);
+
+    // 1. Try fetching dynamic pattern from PostgreSQL first
+    const candidateQueries = [
+        {
+            sql: `SELECT pattern_json, blueprint_text, total_marks, sections 
+                  FROM sgs_exam_patterns 
+                  WHERE (UPPER(exam_type) = $1 OR UPPER(exam_name) = $1)
+                    AND (LOWER(subject) ILIKE $2 OR LOWER(subject) ILIKE $3)
+                    AND (class_level ILIKE $4 OR class_level = $5 OR class_level = 'default')
+                  LIMIT 1`,
+            params: [normExam, `%${subject}%`, `%${subjectCategory}%`, `%${cleanClass}%`, cleanClassNum]
+        },
+        {
+            sql: `SELECT * FROM sgs_exam_blueprints 
+                  WHERE UPPER(exam_type) = $1 AND LOWER(subject) ILIKE $2 LIMIT 1`,
+            params: [normExam, `%${subjectCategory}%`]
+        }
+    ];
+
+    for (const q of candidateQueries) {
+        try {
+            const dbRes = await pool.query(q.sql, q.params);
+            if (dbRes.rows.length > 0) {
+                const row = dbRes.rows[0];
+                return row.blueprint_text || row.pattern_text || row.blueprint || JSON.stringify(row.pattern_json || row.sections || row);
+            }
+        } catch (_) {
+            // Table/column may not exist yet; continue to fallback
+        }
+    }
+
+    // 2. Fallback to Competitive Blueprints if examType is Competitive
+    if (['IIT', 'NEET', 'CEAM', 'COMPETITIVE', 'COMPETITIVE EXAM'].some(k => normExam.includes(k))) {
+        const trackKey = normExam.includes('IIT') ? 'IIT' : normExam.includes('NEET') ? 'NEET' : 'CEAM';
+        return (
+            examBlueprints[cleanClassNum]?.[trackKey] ||
+            `Competitive Exam Pattern (${trackKey} Track): 100% Multiple Choice Questions (4 options each), single correct answer, +4 Marks for correct, -1 Negative Marking. High-application conceptual & numerical questions.`
+        );
+    }
+
+    // 3. Fallback to School PT Blueprints
+    return getSchoolBlueprint(examType, classLevel, subject);
+}
+
 // ==========================================
-// 2. AUTO QUESTION PAPER GENERATOR (CONSTRAINED & TIERED & BLUEPRINT)
+// 2. AUTO QUESTION PAPER GENERATOR (MULTI-CHAPTER PDF + DB BLUEPRINT + COMPETITIVE + CLASS TEST)
 // ==========================================
 export const generateQuestionPaper = async (req, res) => {
     try {
         const body = req.body || {};
-        const { 
-            chapterId, 
-            difficulty = 'Core', 
-            taughtTopics = [], 
-            examType = 'PT2',     
-            questionType = 'All', 
+        const {
+            chapterId,
+            chapterIds,
+            chapters,
+            title = '',
+            difficulty = 'Core',
+            taughtTopics = [],
+            examType = 'PT2',
+            examCategory = '',
+            questionType = 'All',
             totalMarks = 80,
-            classLevel = 'Class 8', 
-            subject = 'Select',
-            userInfo 
+            classLevel = 'Class 8',
+            subject = 'Science',
+            userInfo
         } = body;
 
-        if (!chapterId || chapterId === 'Select chapter first' || String(chapterId).includes('Select')) {
-            return res.status(400).json({ error: "Please select a valid Class, Subject, and Chapter before generating." });
+        // Normalize single or multiple chapter IDs into a clean integer array
+        let rawChapterList = [];
+        if (Array.isArray(chapterIds) && chapterIds.length > 0) rawChapterList = chapterIds;
+        else if (Array.isArray(chapters) && chapters.length > 0) rawChapterList = chapters;
+        else if (Array.isArray(chapterId)) rawChapterList = chapterId;
+        else if (typeof chapterId === 'string' && chapterId.includes(',')) rawChapterList = chapterId.split(',');
+        else if (chapterId !== undefined && chapterId !== null && chapterId !== '') rawChapterList = [chapterId];
+
+        const parsedChapterIds = rawChapterList
+            .map(id => (typeof id === 'object' ? (id.chapter_id || id.id || id.value) : id))
+            .map(id => parseInt(String(id).trim(), 10))
+            .filter(id => !isNaN(id) && id > 0);
+
+        const isClassTest = String(examType).toLowerCase().includes('class test') || String(examCategory).toLowerCase().includes('class test');
+        const isCompetitive = ['iit', 'neet', 'ceam', 'competitive'].some(k =>
+            String(examType).toLowerCase().includes(k) || String(examCategory).toLowerCase().includes(k)
+        );
+
+        // If neither valid chapterIds nor a Class Test title/subject is provided, return a clean string error
+        if (parsedChapterIds.length === 0 && !isClassTest && !title) {
+            return res.status(400).json({
+                error: "Please select at least one valid Chapter before generating.",
+                message: "Please select at least one valid Chapter before generating."
+            });
         }
 
-        const validDifficulties = ['Foundational', 'Core', 'Advanced'];
+        const validDifficulties = ['Foundational', 'Core', 'Advanced', 'Easy', 'Medium', 'Hard'];
         const validatedDifficulty = validDifficulties.includes(difficulty) ? difficulty : 'Core';
+        const targetMarks = parseInt(totalMarks, 10) || (isClassTest ? 20 : 50);
 
-        const result = await pool.query(
-            'SELECT chapter_name, full_text_content FROM sgs_chapter_content WHERE chapter_id = $1', 
-            [chapterId]
-        );
-        
-        if (result.rows.length === 0) return res.status(404).json({ error: "Chapter not found in database" });
-        const { chapter_name, full_text_content } = result.rows[0];
+        // Fetch all selected chapters and their PDF URLs from sgs_file_storage_metadata
+        let chapterRows = [];
+        if (parsedChapterIds.length > 0) {
+            const dbRes = await pool.query(`
+                SELECT 
+                    c.*, 
+                    m.file_url
+                FROM sgs_chapter_content c
+                LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
+                WHERE c.chapter_id = ANY($1::int[])
+                ORDER BY c.chapter_id ASC
+            `, [parsedChapterIds]);
+            chapterRows = dbRes.rows;
+        } else if (subject && subject !== 'Select') {
+            // Class Test fallback when only class + subject + title are chosen
+            const dbRes = await pool.query(`
+                SELECT 
+                    c.*, 
+                    m.file_url
+                FROM sgs_chapter_content c
+                LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
+                WHERE c.subject ILIKE $1
+                ORDER BY c.chapter_id ASC
+                LIMIT 3
+            `, [`%${subject}%`]);
+            chapterRows = dbRes.rows;
+        }
 
-        const topicInstruction = taughtTopics && taughtTopics.length > 0 
-            ? `CRITICAL CONSTRAINT: You MUST ONLY generate questions from the following taught topics: ${taughtTopics.join(', ')}. DO NOT generate questions from any other part of the chapter.`
-            : `Generate questions from the provided textbook content.`;
+        if (chapterRows.length === 0 && parsedChapterIds.length > 0) {
+            return res.status(404).json({
+                error: "Selected chapter(s) not found in database.",
+                message: "Selected chapter(s) not found in database."
+            });
+        }
 
-        const matchedBlueprint = getSchoolBlueprint(examType, classLevel, subject);
+        // Deduplicate chapters by chapter_id in case LEFT JOIN returned multiple metadata rows
+        const uniqueChaptersMap = new Map();
+        for (const r of chapterRows) {
+            if (!uniqueChaptersMap.has(r.chapter_id) || (!uniqueChaptersMap.get(r.chapter_id).file_url && r.file_url)) {
+                uniqueChaptersMap.set(r.chapter_id, r);
+            }
+        }
+        const uniqueChapters = Array.from(uniqueChaptersMap.values());
+
+        let aiParts = [];
+        let combinedTextPrompt = "";
+        const chapterNames = [];
+
+        for (const ch of uniqueChapters) {
+            const chName = ch.chapter_name || `Chapter ${ch.chapter_id}`;
+            chapterNames.push(chName);
+
+            const textContent = (ch.text_column || ch.full_text_content || '').trim();
+            const isPdf = ch.content_format && String(ch.content_format).toLowerCase().includes('pdf');
+            const pdfUrl = ch.file_url ? String(ch.file_url).trim() : null;
+
+            // Priority 1: Use content_format + sgs_file_storage_metadata PDF URL
+            if ((isPdf || !textContent) && pdfUrl) {
+                try {
+                    const pdfResponse = await axios.get(pdfUrl, {
+                        responseType: 'arraybuffer',
+                        timeout: 30000
+                    });
+                    aiParts.push({
+                        inlineData: {
+                            data: Buffer.from(pdfResponse.data).toString('base64'),
+                            mimeType: "application/pdf"
+                        }
+                    });
+                    combinedTextPrompt += `\n--- CHAPTER: "${chName}" (Refer to attached PDF document for "${chName}") ---\n`;
+                    continue;
+                } catch (pdfErr) {
+                    console.warn(`⚠️ Failed to download PDF for chapter ${ch.chapter_id} (${pdfUrl}):`, pdfErr.message);
+                }
+            }
+
+            // Priority 2: Fallback to text content if PDF is unavailable
+            if (textContent) {
+                combinedTextPrompt += `\n--- CHAPTER: "${chName}" ---\n"""\n${textContent}\n"""\n`;
+            }
+        }
+
+        const chapterTitleDisplay = chapterNames.length > 0
+            ? chapterNames.join(', ')
+            : (title || `${classLevel} ${subject} Assessment`);
+
+        const topicInstruction = Array.isArray(taughtTopics) && taughtTopics.length > 0
+            ? `CRITICAL CONSTRAINT: Generate questions ONLY from these taught topics: ${taughtTopics.join(', ')}.`
+            : `Cover key concepts from the chapter(s): ${chapterTitleDisplay}.`;
+
+        const multiChapterDistributionRule = uniqueChapters.length > 1
+            ? `CRITICAL MULTI-CHAPTER DISTRIBUTION: You have been given ${uniqueChapters.length} chapters (${chapterNames.map((n, i) => `Chapter ${i + 1}: "${n}"`).join('; ')}). You MUST distribute questions and marks EVENLY across ALL ${uniqueChapters.length} chapters (~${Math.round(100 / uniqueChapters.length)}% weightage per chapter). Do NOT cluster questions only from the first chapter.`
+            : '';
+
+        // Determine Exam Blueprint (DB -> Competitive -> Class Test -> PT Pattern)
+        const matchedBlueprint = await getDynamicExamBlueprint(examType, classLevel, subject);
         let patternInstruction = "";
 
-        if (matchedBlueprint) {
+        if (isCompetitive) {
             patternInstruction = `
-CRITICAL OFFICIAL SCHOOL BLUEPRINT:
-You MUST strictly model this paper according to the official Godavari Devi Saraf School Pattern for ${classLevel} - ${subject} (${examType}):
+CRITICAL COMPETITIVE EXAM PATTERN (${examType}):
+- Do NOT use the school PT descriptive pattern.
+- Follow the Competitive Exam Pattern strictly: ${matchedBlueprint}
+- Generate ONLY Multiple Choice Questions (MCQs) with 4 distinct options ("options": ["A", "B", "C", "D"]).
+- Include conceptual, analytical, and numerical application questions appropriate for ${classLevel}.
+- Every question must carry equal marks adding up to ${targetMarks} total marks.`;
+        } else if (isClassTest) {
+            patternInstruction = `
+CLASS TEST PATTERN (${targetMarks} Marks):
+- Title: "${title || chapterTitleDisplay}"
+- Create a concise Class Test totaling EXACTLY ${targetMarks} marks:
+  * Section A: Multiple Choice Questions (MCQs) [5 x 1M = 5 Marks]
+  * Section B: Very Short Answer Questions [5 x 1M = 5 Marks]
+  * Section C: Short Answer Questions [3 x 2M = 6 Marks]
+  * Section D: Long / Analytical Question [1 x 4M = 4 Marks]
+  (Scale question counts proportionally if Target Total Marks is ${targetMarks} instead of 20).`;
+        } else if (matchedBlueprint) {
+            patternInstruction = `
+CRITICAL OFFICIAL SCHOOL EXAM BLUEPRINT:
+- Model this paper strictly according to the school pattern for ${classLevel} ${subject} (${examType}):
 """
 ${matchedBlueprint}
 """
-Organize your questions to reflect these exact marks and sectional structures. Map the "section" key in the JSON appropriately (e.g., "Section A - MCQs" or "खण्ड - क").`;
+- Organize questions into the exact sections and mark breakdowns above.`;
         } else {
             const isSpecificType = questionType && questionType !== 'All';
-            patternInstruction = isSpecificType 
-                ? `CRITICAL: Generate ONLY "${questionType}" questions. The entire paper MUST consist exclusively of ${questionType} questions.`
-                : `Generate a balanced mix of objective, short answer, and long answer questions.`;
+            patternInstruction = isSpecificType
+                ? `CRITICAL: Generate ONLY "${questionType}" questions totaling ${targetMarks} marks.`
+                : `Generate a balanced mix of MCQs, Short Answer, and Long Answer questions totaling ${targetMarks} marks.`;
         }
 
-        const prompt = `
-You are an expert school exam paper setter for SMT. GODAVARI DEVI SARAF SENIOR SECONDARY SCHOOL.
-Create a highly accurate, structured Question Paper based STRICTLY on the provided textbook content.
+        const promptText = `
+You are an expert exam paper setter for SMT. GODAVARI DEVI SARAF SENIOR SECONDARY SCHOOL.
+Generate a complete, ready-to-print Question Paper.
 
-EXAM PARAMETERS:
+EXAM DETAILS:
+Title: ${title || `${examType} - ${subject}`}
 Class: ${classLevel}
 Subject: ${subject}
-Chapter: "${chapter_name}"
-Exam Name: ${examType}
+Chapters Covered: ${chapterTitleDisplay}
+Exam Type: ${examType}
 Difficulty Tier: ${validatedDifficulty}
-Target Total Marks: ${totalMarks}
+Target Total Marks: ${targetMarks}
 
-TEXTBOOK CONTENT:
-"""
-${full_text_content}
-"""
+${combinedTextPrompt ? `SOURCE CONTENT:\n${combinedTextPrompt}` : ''}
 
-INSTRUCTIONS:
+STRICT QUALITY & FORMATTING RULES:
 1. ${topicInstruction}
-2. ${patternInstruction}
-3. The sum of all question marks MUST add up exactly to ${totalMarks}.
-4. Return STRICTLY a valid JSON array of objects. Do not include markdown code block formatting outside the array.
+2. ${multiChapterDistributionRule}
+3. ${patternInstruction}
+4. DIRECT PHRASING ONLY: Frame every question as a direct, standalone exam question. NEVER use phrases like "According to the textbook", "Based on the provided text", "In the given PDF", "As mentioned in the chapter", or "According to the passage" (unless the section itself is an Unseen/Reading Comprehension passage and you include the full passage inside the question text).
+5. COMPLETE GENERATION: Every single question in the paper MUST be fully written by you with complete question text, options (for MCQs), and a complete answer key. NEVER leave any question blank, incomplete, or with placeholders like "Not Generated by AI Yet" or "Write it myself".
+6. EXACT MARKS: The sum of "marks" across all questions MUST equal ${targetMarks}.
+7. Return STRICTLY a valid JSON array of question objects. Do not wrap in markdown backticks.
 
-Ensure the output EXACTLY matches this schema:
+REQUIRED JSON ARRAY SCHEMA:
 [
   {
-    "section": "Section Name / Heading (e.g., Section A, खण्ड - क, or I అపరిచిత గద్యం)",
+    "section": "Section A",
+    "chapter": "Name of the chapter this question is from",
     "questionNumber": 1,
-    "question": "The question text",
+    "question": "Direct, complete question text here",
+    "questionText": "Direct, complete question text here",
     "type": "MCQ | Short Answer | Long Answer | Fill in the Blanks | True/False | Matching | Case Study | Diagram",
-    "options": ["Option A", "Option B", "Option C", "Option D"], // Array of strings for MCQs or Matching pairs; otherwise null
-    "answer": "The correct answer and marking scheme explanation",
-    "marks": 1
+    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "answer": "Complete correct answer and marking scheme",
+    "marks": 1,
+    "difficulty": "${validatedDifficulty}"
   }
 ]
 `;
 
-        const aiResult = await model.generateContent(prompt);
-        
-        let cleanedText = aiResult.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+        aiParts.unshift({ text: promptText });
+
+        const aiResult = await model.generateContent(aiParts);
+        const rawText = typeof aiResult?.text === 'function'
+            ? aiResult.text()
+            : (aiResult?.text || aiResult?.response?.text?.() || '');
+
+        let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
         const jsonMatch = cleanedText.match(/\[[\s\S]*\]/);
-        
+
         if (!jsonMatch) {
-            throw new Error("Failed to parse AI output into valid JSON array structure.");
+            throw new Error("AI did not return a valid JSON array of questions.");
         }
-        const structuredQuestions = JSON.parse(jsonMatch[0]);
+
+        const parsedQuestions = JSON.parse(jsonMatch[0]);
+
+        // Normalize every question object so the frontend never shows "Not Generated by AI Yet"
+        const structuredQuestions = parsedQuestions.map((q, idx) => {
+            const qText = (q.question || q.questionText || q.text || '').trim()
+                .replace(/^(according to the textbook,?\s*|based on the (provided )?(text|chapter|pdf),?\s*)/i, '');
+            const formattedText = qText.charAt(0).toUpperCase() + qText.slice(1);
+
+            return {
+                id: q.id || idx + 1,
+                section: q.section || "Section A",
+                chapter: q.chapter || chapterNames[idx % (chapterNames.length || 1)] || chapterTitleDisplay,
+                questionNumber: q.questionNumber || idx + 1,
+                question: formattedText,
+                questionText: formattedText,
+                text: formattedText,
+                type: q.type || (Array.isArray(q.options) && q.options.length > 0 ? "MCQ" : "Short Answer"),
+                options: Array.isArray(q.options) ? q.options : null,
+                answer: q.answer || q.correctAnswer || "",
+                correctAnswer: q.answer || q.correctAnswer || "",
+                marks: Number(q.marks) || 1,
+                difficulty: q.difficulty || validatedDifficulty,
+                isGenerated: true,
+                status: "generated"
+            };
+        });
 
         await logAIUsage(
-            userInfo, 
-            "Teacher Dashboard - Auto Test", 
-            `Generate School Paper (${examType} - ${subject} - ${classLevel} - ${validatedDifficulty})`, 
+            userInfo,
+            "Teacher Dashboard - Auto Test",
+            `Generate School Paper (${examType} - ${subject} - ${classLevel} - ${validatedDifficulty})`,
             aiResult.usageMetadata || aiResult.response?.usageMetadata
         );
 
-        res.json({ questions: structuredQuestions });
+        res.json({
+            status: "success",
+            title: title || `${examType} - ${subject}`,
+            examType,
+            classLevel,
+            subject,
+            totalMarks: targetMarks,
+            chapters: chapterNames,
+            questions: structuredQuestions
+        });
 
     } catch (err) {
         console.error("🚨 QUESTION PAPER CRASH:", err);
-        res.status(500).json({ error: "Failed to generate question paper.", details: err.message });
+        // Return plain string error fields so frontend toast/alert never prints "[object Object]"
+        res.status(500).json({
+            status: "error",
+            error: err.message || "Failed to generate question paper.",
+            message: err.message || "Failed to generate question paper.",
+            details: String(err.message || err)
+        });
+    }
+};
+
+// ==========================================
+// 2B. REWRITE OR REPLACE SINGLE QUESTION
+// ==========================================
+export const rewriteOrReplaceQuestion = async (req, res) => {
+    try {
+        const {
+            action = 'rewrite', // 'rewrite' | 'replace'
+            question,
+            questionText,
+            currentQuestion,
+            type = 'Short Answer',
+            marks = 1,
+            section = 'Section A',
+            difficulty = 'Core',
+            classLevel = 'Class 8',
+            subject = 'Science',
+            chapterId,
+            chapterName = '',
+            instruction = '',
+            userInfo
+        } = req.body || {};
+
+        const originalQ = question || questionText || currentQuestion?.question || currentQuestion?.questionText || '';
+        const qType = currentQuestion?.type || type;
+        const qMarks = Number(currentQuestion?.marks || marks) || 1;
+        const qSection = currentQuestion?.section || section;
+
+        if (!originalQ && action === 'rewrite') {
+            return res.status(400).json({
+                error: "Original question text is required to rewrite.",
+                message: "Original question text is required to rewrite."
+            });
+        }
+
+        // Optionally fetch chapter context if chapterId is supplied
+        let chapterContext = "";
+        if (chapterId && !isNaN(parseInt(chapterId, 10))) {
+            try {
+                const chRes = await pool.query(
+                    `SELECT chapter_name, full_text_content FROM sgs_chapter_content WHERE chapter_id = $1 LIMIT 1`,
+                    [parseInt(chapterId, 10)]
+                );
+                if (chRes.rows.length > 0) {
+                    const ch = chRes.rows[0];
+                    chapterContext = `Chapter: "${ch.chapter_name}"\n${ch.full_text_content ? `Context:\n${ch.full_text_content.slice(0, 4000)}` : ''}`;
+                }
+            } catch (_) {}
+        }
+
+        const taskInstruction = String(action).toLowerCase() === 'replace'
+            ? `Generate a BRAND NEW question testing a different concept/sub-topic from the same chapter/subject to REPLACE the current question: "${originalQ}".`
+            : `REWRITE and improve the clarity, academic phrasing, and precision of this question while keeping the same core concept and mark weightage: "${originalQ}".`;
+
+        const prompt = `
+You are an expert school examiner for ${classLevel} ${subject}.
+Task: ${taskInstruction}
+${instruction ? `Teacher's specific instruction: ${instruction}` : ''}
+${chapterName ? `Chapter: ${chapterName}` : ''}
+${chapterContext}
+
+Question Type: ${qType}
+Marks: ${qMarks}
+Difficulty: ${difficulty}
+
+CRITICAL RULES:
+1. Frame as a direct exam question. NEVER use phrases like "According to the textbook" or "Based on the text".
+2. Return ONLY a valid JSON object matching the exact structure below (no markdown blocks):
+{
+  "section": "${qSection}",
+  "question": "The new or rewritten question text",
+  "questionText": "The new or rewritten question text",
+  "type": "${qType}",
+  "options": ${qType === 'MCQ' ? '["Option A", "Option B", "Option C", "Option D"]' : 'null'},
+  "answer": "Complete answer and marking scheme",
+  "marks": ${qMarks},
+  "difficulty": "${difficulty}"
+}
+`;
+
+        const aiResult = await model.generateContent(prompt);
+        const rawText = typeof aiResult?.text === 'function'
+            ? aiResult.text()
+            : (aiResult?.text || aiResult?.response?.text?.() || '');
+
+        const cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
+        const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error("Failed to parse rewritten/replaced question JSON.");
+
+        const updatedQ = JSON.parse(jsonMatch[0]);
+        const finalQuestionText = (updatedQ.question || updatedQ.questionText || '').trim();
+
+        const normalizedQuestion = {
+            ...(typeof currentQuestion === 'object' ? currentQuestion : {}),
+            section: updatedQ.section || qSection,
+            question: finalQuestionText,
+            questionText: finalQuestionText,
+            text: finalQuestionText,
+            type: updatedQ.type || qType,
+            options: Array.isArray(updatedQ.options) ? updatedQ.options : null,
+            answer: updatedQ.answer || "",
+            correctAnswer: updatedQ.answer || "",
+            marks: Number(updatedQ.marks) || qMarks,
+            difficulty: updatedQ.difficulty || difficulty,
+            isGenerated: true
+        };
+
+        await logAIUsage(
+            userInfo,
+            "Teacher Dashboard - Auto Test",
+            `${action === 'replace' ? 'Replace' : 'Rewrite'} Question (${subject})`,
+            aiResult.usageMetadata || aiResult.response?.usageMetadata
+        );
+
+        res.json({
+            status: "success",
+            question: normalizedQuestion,
+            updatedQuestion: normalizedQuestion,
+            data: normalizedQuestion
+        });
+    } catch (err) {
+        console.error("🚨 REWRITE/REPLACE QUESTION CRASH:", err);
+        res.status(500).json({
+            error: err.message || "Failed to modify question.",
+            message: err.message || "Failed to modify question."
+        });
+    }
+};
+
+// ==========================================
+// 2C. SAVE GENERATED QUESTION PAPER & GET SAVED PAPERS
+// ==========================================
+export const saveQuestionPaper = async (req, res) => {
+    try {
+        const {
+            title = 'Untitled Question Paper',
+            examType = 'PT1',
+            classLevel = 'Class 8',
+            subject = 'Science',
+            chapterIds = [],
+            totalMarks = 50,
+            difficulty = 'Core',
+            questions = [],
+            userInfo
+        } = req.body || {};
+
+        const teacherId = userInfo?.id || req.body?.teacherId || 3;
+
+        if (!Array.isArray(questions) || questions.length === 0) {
+            return res.status(400).json({
+                error: "Cannot save an empty question paper.",
+                message: "Cannot save an empty question paper."
+            });
+        }
+
+        // Ensure table exists so saving works out-of-the-box in both Staging and Production
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS sgs_question_papers (
+                paper_id SERIAL PRIMARY KEY,
+                teacher_id INTEGER,
+                title TEXT NOT NULL,
+                exam_type VARCHAR(50),
+                class_level VARCHAR(50),
+                subject VARCHAR(100),
+                chapter_ids JSONB DEFAULT '[]'::jsonb,
+                total_marks INTEGER DEFAULT 50,
+                difficulty VARCHAR(50) DEFAULT 'Core',
+                questions_json JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        const insertRes = await pool.query(`
+            INSERT INTO sgs_question_papers 
+                (teacher_id, title, exam_type, class_level, subject, chapter_ids, total_marks, difficulty, questions_json, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+            RETURNING paper_id, title, exam_type, class_level, subject, total_marks, created_at;
+        `, [
+            teacherId,
+            title,
+            examType,
+            classLevel,
+            subject,
+            JSON.stringify(chapterIds),
+            parseInt(totalMarks, 10) || 50,
+            difficulty,
+            JSON.stringify(questions)
+        ]);
+
+        res.status(201).json({
+            status: "success",
+            message: "Question paper saved successfully.",
+            paper: insertRes.rows[0],
+            paperId: insertRes.rows[0].paper_id
+        });
+    } catch (err) {
+        console.error("🚨 SAVE QUESTION PAPER CRASH:", err);
+        res.status(500).json({
+            error: err.message || "Failed to save question paper.",
+            message: err.message || "Failed to save question paper."
+        });
+    }
+};
+
+export const getSavedQuestionPapers = async (req, res) => {
+    try {
+        const teacherId = req.query?.teacherId || req.body?.userInfo?.id || 3;
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS sgs_question_papers (
+                paper_id SERIAL PRIMARY KEY,
+                teacher_id INTEGER,
+                title TEXT NOT NULL,
+                exam_type VARCHAR(50),
+                class_level VARCHAR(50),
+                subject VARCHAR(100),
+                chapter_ids JSONB DEFAULT '[]'::jsonb,
+                total_marks INTEGER DEFAULT 50,
+                difficulty VARCHAR(50) DEFAULT 'Core',
+                questions_json JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        const result = await pool.query(
+            `SELECT * FROM sgs_question_papers WHERE teacher_id = $1 ORDER BY created_at DESC LIMIT 50`,
+            [teacherId]
+        );
+
+        res.json({ status: "success", papers: result.rows });
+    } catch (err) {
+        console.error("🚨 FETCH SAVED QUESTION PAPERS CRASH:", err);
+        res.status(500).json({ error: err.message || "Failed to fetch saved question papers." });
     }
 };
 
