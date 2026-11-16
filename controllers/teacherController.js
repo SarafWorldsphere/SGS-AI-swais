@@ -2,6 +2,7 @@ import pool from '../config/db.js';
 import model from '../config/aiConfig.js';
 import { logAIUsage } from '../utils/aiTracker.js';
 import textToSpeech from '@google-cloud/text-to-speech';
+import axios from 'axios'; 
 
 // Google Cloud TTS Client Initialize using your API KEY from .env
 const ttsClient = new textToSpeech.TextToSpeechClient({
@@ -187,25 +188,50 @@ export const generateLessonPlan = async (req, res) => {
     if (!chapterId) return res.status(400).json({ error: "Chapter ID is required" });
 
     try {
-        const result = await pool.query(
-            'SELECT chapter_name, full_text_content FROM sgs_chapter_content WHERE chapter_id = $1', 
-            [chapterId]
-        );
+        // FIX 1: Safely query both text and PDF URL columns using a LEFT JOIN.
+        // NOTE: Adjust the ON condition (e.g., c.file_id = m.id) if your foreign key differs.
+        const result = await pool.query(`
+            SELECT 
+                c.chapter_name, 
+                c.text_column, 
+                c.content_format, 
+                m.file_url 
+            FROM sgs_chapter_content c
+            LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
+            WHERE c.chapter_id = $1
+        `, [chapterId]);
 
         if (result.rows.length === 0) return res.status(404).json({ error: "Chapter not found in database" });
         
-        const { chapter_name, full_text_content } = result.rows[0];
+        const { chapter_name, text_column, content_format, file_url } = result.rows[0];
         const finalTopic = topic && topic.trim() !== '' ? topic : chapter_name;
 
-        const prompt = `
+        let aiParts = [];
+        let textContentText = "";
+
+        // FIX 2: Dynamically handle Text (Staging) vs PDF (Production)
+        if (text_column && text_column.trim() !== '') {
+            textContentText = `\nTEXTBOOK CONTENT:\n"""\n${text_column}\n"""\n`;
+        } else if (content_format === 'pdf' || file_url) {
+            if (!file_url) throw new Error("PDF content specified, but no file URL was found in metadata.");
+            
+            // Download the PDF from the URL and feed it to Gemini natively
+            const pdfResponse = await axios.get(file_url, { responseType: 'arraybuffer' });
+            aiParts.push({
+                inlineData: {
+                    data: Buffer.from(pdfResponse.data).toString('base64'),
+                    mimeType: "application/pdf"
+                }
+            });
+            textContentText = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
+        } else {
+            return res.status(404).json({ error: "No chapter content (text or PDF) found to generate lesson plan." });
+        }
+
+        const promptText = `
 You are an expert school teacher. Create a day-wise lesson plan for the chapter "${finalTopic}".
 You have exactly ${noOfPeriods} days (periods) to complete this chapter.
-
-TEXTBOOK CONTENT:
-"""
-${full_text_content}
-"""
-
+${textContentText}
 CRITICAL INSTRUCTIONS:
 1. Divide the chapter content logically across exactly ${noOfPeriods} days.
 2. Focus ONLY on the textbook content provided. Do not invent unrelated topics.
@@ -226,8 +252,10 @@ REQUIRED JSON STRUCTURE:
   ]
 }
 `;
+        // Pass the text prompt as the first part, followed by the PDF part (if any)
+        aiParts.unshift({ text: promptText });
 
-        const aiResult = await model.generateContent(prompt);
+        const aiResult = await model.generateContent(aiParts);
         
         let cleanedText = aiResult.text.replace(/```json/gi, '').replace(/```/g, '').trim();
         const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
@@ -243,7 +271,7 @@ REQUIRED JSON STRUCTURE:
         );
 
         await pool.query(
-            `INSERT INTO lesson_plans (teacher_id, title, chapter_id, chapter_text, duration_minutes, created_at)
+            `INSERT INTO sgs_lesson_plans (teacher_id, title, chapter_id, chapter_text, duration_minutes, created_at)
              VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
             [teacherId, `Day-wise Plan: ${finalTopic}`, chapterId, chapter_name, durationMinutes]
         );
