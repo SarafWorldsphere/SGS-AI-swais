@@ -171,6 +171,14 @@ const examBlueprints = {
     }
 };
 
+const extractAIText = (aiResult) => {
+    if (typeof aiResult?.text === 'string') return aiResult.text;
+    if (typeof aiResult?.text === 'function') return aiResult.text();
+    if (typeof aiResult?.response?.text === 'function') return aiResult.response.text();
+    if (typeof aiResult?.response?.text === 'string') return aiResult.response.text;
+    return '';
+};
+
 // ==========================================
 // 1. AUTO LESSON PLANNER (DAY-WISE JSON)
 // ==========================================
@@ -188,34 +196,39 @@ export const generateLessonPlan = async (req, res) => {
     if (!chapterId) return res.status(400).json({ error: "Chapter ID is required" });
 
     try {
-        // Safe LEFT JOIN for Staging (text_column) and Production (file_url)
+        // Use c.* so PostgreSQL doesn't crash in Production where text_column does not exist
         const result = await pool.query(`
             SELECT 
-                c.chapter_name, 
-                c.text_column,
-                c.full_text_content, 
-                c.content_format, 
+                c.*, 
                 m.file_url 
             FROM sgs_chapter_content c
             LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
             WHERE c.chapter_id = $1
+            LIMIT 1
         `, [chapterId]);
 
-        if (result.rows.length === 0) return res.status(404).json({ error: "Chapter not found in database" });
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Chapter not found in database" });
+        }
         
         const row = result.rows[0];
-        const chapter_name = row.chapter_name;
+        const chapter_name = row.chapter_name || "Chapter";
         const finalTopic = topic && topic.trim() !== '' ? topic : chapter_name;
         
-        const textContent = row.text_column || row.full_text_content;
+        // Safely check for text content (Staging: text_column, or full_text_content if populated)
+        const textContent = (row.text_column || row.full_text_content || '').trim();
+        const isPdfFormat = row.content_format && row.content_format.toLowerCase().includes('pdf');
+        const pdfUrl = row.file_url ? row.file_url.trim() : null;
 
         let aiParts = [];
         let contentPrompt = "";
 
-        if (textContent && textContent.trim() !== '') {
-            contentPrompt = `\nTEXTBOOK CONTENT:\n"""\n${textContent}\n"""\n`;
-        } else if ((row.content_format === 'pdf' || row.file_url?.endsWith('.pdf')) && row.file_url) {
-            const pdfResponse = await axios.get(row.file_url, { responseType: 'arraybuffer' });
+        // Priority 1: If Production specifies PDF via content_format (or has a file_url in metadata), fetch the PDF
+        if ((isPdfFormat || !textContent) && pdfUrl) {
+            const pdfResponse = await axios.get(pdfUrl, { 
+                responseType: 'arraybuffer',
+                timeout: 30000 
+            });
             aiParts.push({
                 inlineData: {
                     data: Buffer.from(pdfResponse.data).toString('base64'),
@@ -223,8 +236,16 @@ export const generateLessonPlan = async (req, res) => {
                 }
             });
             contentPrompt = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
-        } else {
-            return res.status(404).json({ error: "No chapter content (text or PDF) found to generate lesson plan." });
+        } 
+        // Priority 2: Fallback to text content (Staging environment)
+        else if (textContent) {
+            contentPrompt = `\nTEXTBOOK CONTENT:\n"""\n${textContent}\n"""\n`;
+        } 
+        // Neither PDF nor text content is available
+        else {
+            return res.status(404).json({ 
+                error: "No chapter content (PDF in sgs_file_storage_metadata or text) found to generate lesson plan." 
+            });
         }
 
         const promptText = `
@@ -254,9 +275,11 @@ REQUIRED JSON STRUCTURE:
         
         aiParts.unshift({ text: promptText });
 
+        // Pass array of parts for multimodal (PDF + text) or text-only
         const aiResult = await model.generateContent(aiParts);
+        const rawText = extractAIText(aiResult);
         
-        let cleanedText = aiResult.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+        let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
         const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
         
         if (!jsonMatch) throw new Error("Failed to parse AI output into valid JSON.");
@@ -269,11 +292,16 @@ REQUIRED JSON STRUCTURE:
             aiResult.usageMetadata || aiResult.response?.usageMetadata
         );
 
-        await pool.query(
-            `INSERT INTO sgs_lesson_plans (teacher_id, title, chapter_id, chapter_text, duration_minutes, created_at)
-             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
-            [teacherId, `Day-wise Plan: ${finalTopic}`, chapterId, chapter_name, durationMinutes]
-        );
+        // Wrap DB logging in its own try/catch so schema differences in sgs_lesson_plans never break the response
+        try {
+            await pool.query(
+                `INSERT INTO sgs_lesson_plans (teacher_id, title, chapter_id, chapter_text, duration_minutes, created_at)
+                 VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+                [teacherId, `Day-wise Plan: ${finalTopic}`, chapterId, JSON.stringify(structuredPlan), durationMinutes]
+            );
+        } catch (dbInsertErr) {
+            console.warn("⚠️ Could not save lesson plan to sgs_lesson_plans:", dbInsertErr.message);
+        }
 
         res.json({ lessonPlan: structuredPlan });
     } catch (err) {
