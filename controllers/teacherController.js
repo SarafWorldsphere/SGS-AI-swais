@@ -235,7 +235,8 @@ You are an expert school teacher. Create a day-wise lesson plan for the chapter 
 You have exactly ${noOfPeriods} days (periods) to complete this chapter.
 ${contentPrompt}
 CRITICAL INSTRUCTIONS:
-1. Divide the chapter content logically across exactly ${noOfPeriods} days.
+1. Divide the chapter content logically across exactly 
+${noOfPeriods} days.
 2. Focus ONLY on the textbook content provided. Do not invent unrelated topics.
 3. You MUST return ONLY a valid JSON object matching the exact structure below. Do not include markdown blocks or plain text.
 
