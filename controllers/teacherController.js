@@ -1,3 +1,4 @@
+cat << 'EOF' > /home/ubuntu/swais-backend/controllers/teacherController.js
 import pool from '../config/db.js';
 import model from '../config/aiConfig.js';
 import { logAIUsage } from '../utils/aiTracker.js';
@@ -8,6 +9,15 @@ import axios from 'axios';
 const ttsClient = new textToSpeech.TextToSpeechClient({
     apiKey: process.env.GOOGLE_TTS_API_KEY
 });
+
+// Helper to safely extract text across Gemini SDK versions
+const extractAIText = (aiResult) => {
+    if (typeof aiResult?.text === 'string') return aiResult.text;
+    if (typeof aiResult?.text === 'function') return aiResult.text();
+    if (typeof aiResult?.response?.text === 'function') return aiResult.response.text();
+    if (typeof aiResult?.response?.text === 'string') return aiResult.response.text;
+    return '';
+};
 
 // 🌍 Google Cloud Voice Mapping
 const googleVoiceMap = {
@@ -110,9 +120,6 @@ const schoolExamBlueprints = {
     }
 };
 
-/**
- * Standardize subject names for dictionary matching
- */
 function resolveSubjectCategory(subject = '') {
     const sub = subject.toLowerCase();
     if (sub.includes('math')) return 'Maths';
@@ -125,9 +132,6 @@ function resolveSubjectCategory(subject = '') {
     return 'default';
 }
 
-/**
- * Retrieve the exact blueprint pattern based on requested parameters
- */
 function getSchoolBlueprint(examType, classLevel, subject) {
     const normExam = (examType || '').toUpperCase().trim();
     let examGroup = null;
@@ -146,9 +150,6 @@ function getSchoolBlueprint(examType, classLevel, subject) {
     return subjectPatterns[cleanClass] || subjectPatterns['default'] || null;
 }
 
-// ==========================================
-// 🌍 COMPETITIVE EXAM BLUEPRINT CONFIGURATION DICTIONARY
-// ==========================================
 const examBlueprints = {
     "6": {
         "IIT": "Class 6 IIT Track: Focus on foundational algebra, logical reasoning, and basic physics mechanics. +4 Marks, -1 Negative Marking.",
@@ -171,13 +172,50 @@ const examBlueprints = {
     }
 };
 
-const extractAIText = (aiResult) => {
-    if (typeof aiResult?.text === 'string') return aiResult.text;
-    if (typeof aiResult?.text === 'function') return aiResult.text();
-    if (typeof aiResult?.response?.text === 'function') return aiResult.response.text();
-    if (typeof aiResult?.response?.text === 'string') return aiResult.response.text;
-    return '';
-};
+// Retrieve Exam Blueprint from Database first, fallback to dictionary
+async function getDynamicExamBlueprint(examType, classLevel, subject) {
+    const normExam = (examType || '').toUpperCase().trim();
+    const cleanClass = (classLevel || '').trim();
+    const cleanClassNum = cleanClass.replace(/\D/g, '');
+    const subjectCategory = resolveSubjectCategory(subject);
+
+    const candidateQueries = [
+        {
+            sql: `SELECT pattern_json, blueprint_text, total_marks, sections 
+                  FROM sgs_exam_patterns 
+                  WHERE (UPPER(exam_type) = $1 OR UPPER(exam_name) = $1)
+                    AND (LOWER(subject) ILIKE $2 OR LOWER(subject) ILIKE $3)
+                    AND (class_level ILIKE $4 OR class_level = $5 OR class_level = 'default')
+                  LIMIT 1`,
+            params: [normExam, `%${subject}%`, `%${subjectCategory}%`, `%${cleanClass}%`, cleanClassNum]
+        },
+        {
+            sql: `SELECT * FROM sgs_exam_blueprints 
+                  WHERE UPPER(exam_type) = $1 AND LOWER(subject) ILIKE $2 LIMIT 1`,
+            params: [normExam, `%${subjectCategory}%`]
+        }
+    ];
+
+    for (const q of candidateQueries) {
+        try {
+            const dbRes = await pool.query(q.sql, q.params);
+            if (dbRes.rows.length > 0) {
+                const row = dbRes.rows[0];
+                return row.blueprint_text || row.pattern_text || row.blueprint || JSON.stringify(row.pattern_json || row.sections || row);
+            }
+        } catch (_) {}
+    }
+
+    if (['IIT', 'NEET', 'CEAM', 'COMPETITIVE', 'COMPETITIVE EXAM'].some(k => normExam.includes(k))) {
+        const trackKey = normExam.includes('IIT') ? 'IIT' : normExam.includes('NEET') ? 'NEET' : 'CEAM';
+        return (
+            examBlueprints[cleanClassNum]?.[trackKey] ||
+            `Competitive Exam Pattern (${trackKey} Track): 100% Multiple Choice Questions (4 options each), single correct answer, +4 Marks for correct, -1 Negative Marking.`
+        );
+    }
+
+    return getSchoolBlueprint(examType, classLevel, subject);
+}
 
 // ==========================================
 // 1. AUTO LESSON PLANNER (DAY-WISE JSON)
@@ -189,14 +227,13 @@ export const generateLessonPlan = async (req, res) => {
         userInfo,
         topic,
         noOfPeriods = 5
-    } = req.body;
+    } = req.body || {};
 
     const teacherId = userInfo?.id || 3;
 
     if (!chapterId) return res.status(400).json({ error: "Chapter ID is required" });
 
     try {
-        // Use c.* so PostgreSQL doesn't crash in Production where text_column does not exist
         const result = await pool.query(`
             SELECT 
                 c.*, 
@@ -207,28 +244,21 @@ export const generateLessonPlan = async (req, res) => {
             LIMIT 1
         `, [chapterId]);
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: "Chapter not found in database" });
-        }
+        if (result.rows.length === 0) return res.status(404).json({ error: "Chapter not found in database" });
         
         const row = result.rows[0];
         const chapter_name = row.chapter_name || "Chapter";
         const finalTopic = topic && topic.trim() !== '' ? topic : chapter_name;
         
-        // Safely check for text content (Staging: text_column, or full_text_content if populated)
         const textContent = (row.text_column || row.full_text_content || '').trim();
-        const isPdfFormat = row.content_format && row.content_format.toLowerCase().includes('pdf');
-        const pdfUrl = row.file_url ? row.file_url.trim() : null;
+        const isPdfFormat = row.content_format && String(row.content_format).toLowerCase().includes('pdf');
+        const pdfUrl = row.file_url ? String(row.file_url).trim() : null;
 
         let aiParts = [];
         let contentPrompt = "";
 
-        // Priority 1: If Production specifies PDF via content_format (or has a file_url in metadata), fetch the PDF
         if ((isPdfFormat || !textContent) && pdfUrl) {
-            const pdfResponse = await axios.get(pdfUrl, { 
-                responseType: 'arraybuffer',
-                timeout: 30000 
-            });
+            const pdfResponse = await axios.get(pdfUrl, { responseType: 'arraybuffer', timeout: 30000 });
             aiParts.push({
                 inlineData: {
                     data: Buffer.from(pdfResponse.data).toString('base64'),
@@ -236,16 +266,10 @@ export const generateLessonPlan = async (req, res) => {
                 }
             });
             contentPrompt = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
-        } 
-        // Priority 2: Fallback to text content (Staging environment)
-        else if (textContent) {
+        } else if (textContent) {
             contentPrompt = `\nTEXTBOOK CONTENT:\n"""\n${textContent}\n"""\n`;
-        } 
-        // Neither PDF nor text content is available
-        else {
-            return res.status(404).json({ 
-                error: "No chapter content (PDF in sgs_file_storage_metadata or text) found to generate lesson plan." 
-            });
+        } else {
+            return res.status(404).json({ error: "No chapter content (PDF in sgs_file_storage_metadata or text) found to generate lesson plan." });
         }
 
         const promptText = `
@@ -275,7 +299,6 @@ REQUIRED JSON STRUCTURE:
         
         aiParts.unshift({ text: promptText });
 
-        // Pass array of parts for multimodal (PDF + text) or text-only
         const aiResult = await model.generateContent(aiParts);
         const rawText = extractAIText(aiResult);
         
@@ -292,15 +315,14 @@ REQUIRED JSON STRUCTURE:
             aiResult.usageMetadata || aiResult.response?.usageMetadata
         );
 
-        // Wrap DB logging in its own try/catch so schema differences in sgs_lesson_plans never break the response
         try {
             await pool.query(
                 `INSERT INTO sgs_lesson_plans (teacher_id, title, chapter_id, chapter_text, duration_minutes, created_at)
                  VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
-                [teacherId, `Day-wise Plan: ${finalTopic}`, chapterId, JSON.stringify(structuredPlan), durationMinutes]
+                [teacherId, `Day-wise Plan: ${finalTopic}`, chapterId, chapter_name, durationMinutes]
             );
-        } catch (dbInsertErr) {
-            console.warn("⚠️ Could not save lesson plan to sgs_lesson_plans:", dbInsertErr.message);
+        } catch (dbErr) {
+            console.warn("⚠️ Non-blocking: Could not save to sgs_lesson_plans:", dbErr.message);
         }
 
         res.json({ lessonPlan: structuredPlan });
@@ -309,58 +331,6 @@ REQUIRED JSON STRUCTURE:
         res.status(500).json({ error: "Failed to generate lesson plan.", details: err.message });
     }
 };
-
-// =========================================================================
-// HELPER: RETRIEVE EXAM BLUEPRINT FROM DB (WITH FALLBACK TO DICTIONARY)
-// =========================================================================
-async function getDynamicExamBlueprint(examType, classLevel, subject) {
-    const normExam = (examType || '').toUpperCase().trim();
-    const cleanClass = (classLevel || '').trim();
-    const cleanClassNum = cleanClass.replace(/\D/g, '');
-    const subjectCategory = resolveSubjectCategory(subject);
-
-    // 1. Try fetching dynamic pattern from PostgreSQL first
-    const candidateQueries = [
-        {
-            sql: `SELECT pattern_json, blueprint_text, total_marks, sections 
-                  FROM sgs_exam_patterns 
-                  WHERE (UPPER(exam_type) = $1 OR UPPER(exam_name) = $1)
-                    AND (LOWER(subject) ILIKE $2 OR LOWER(subject) ILIKE $3)
-                    AND (class_level ILIKE $4 OR class_level = $5 OR class_level = 'default')
-                  LIMIT 1`,
-            params: [normExam, `%${subject}%`, `%${subjectCategory}%`, `%${cleanClass}%`, cleanClassNum]
-        },
-        {
-            sql: `SELECT * FROM sgs_exam_blueprints 
-                  WHERE UPPER(exam_type) = $1 AND LOWER(subject) ILIKE $2 LIMIT 1`,
-            params: [normExam, `%${subjectCategory}%`]
-        }
-    ];
-
-    for (const q of candidateQueries) {
-        try {
-            const dbRes = await pool.query(q.sql, q.params);
-            if (dbRes.rows.length > 0) {
-                const row = dbRes.rows[0];
-                return row.blueprint_text || row.pattern_text || row.blueprint || JSON.stringify(row.pattern_json || row.sections || row);
-            }
-        } catch (_) {
-            // Table/column may not exist yet; continue to fallback
-        }
-    }
-
-    // 2. Fallback to Competitive Blueprints if examType is Competitive
-    if (['IIT', 'NEET', 'CEAM', 'COMPETITIVE', 'COMPETITIVE EXAM'].some(k => normExam.includes(k))) {
-        const trackKey = normExam.includes('IIT') ? 'IIT' : normExam.includes('NEET') ? 'NEET' : 'CEAM';
-        return (
-            examBlueprints[cleanClassNum]?.[trackKey] ||
-            `Competitive Exam Pattern (${trackKey} Track): 100% Multiple Choice Questions (4 options each), single correct answer, +4 Marks for correct, -1 Negative Marking. High-application conceptual & numerical questions.`
-        );
-    }
-
-    // 3. Fallback to School PT Blueprints
-    return getSchoolBlueprint(examType, classLevel, subject);
-}
 
 // ==========================================
 // 2. AUTO QUESTION PAPER GENERATOR (MULTI-CHAPTER PDF + DB BLUEPRINT + COMPETITIVE + CLASS TEST)
@@ -390,7 +360,9 @@ export const generateQuestionPaper = async (req, res) => {
         else if (Array.isArray(chapters) && chapters.length > 0) rawChapterList = chapters;
         else if (Array.isArray(chapterId)) rawChapterList = chapterId;
         else if (typeof chapterId === 'string' && chapterId.includes(',')) rawChapterList = chapterId.split(',');
-        else if (chapterId !== undefined && chapterId !== null && chapterId !== '') rawChapterList = [chapterId];
+        else if (chapterId !== undefined && chapterId !== null && chapterId !== '' && !String(chapterId).includes('Select')) {
+            rawChapterList = [chapterId];
+        }
 
         const parsedChapterIds = rawChapterList
             .map(id => (typeof id === 'object' ? (id.chapter_id || id.id || id.value) : id))
@@ -402,7 +374,6 @@ export const generateQuestionPaper = async (req, res) => {
             String(examType).toLowerCase().includes(k) || String(examCategory).toLowerCase().includes(k)
         );
 
-        // If neither valid chapterIds nor a Class Test title/subject is provided, return a clean string error
         if (parsedChapterIds.length === 0 && !isClassTest && !title) {
             return res.status(400).json({
                 error: "Please select at least one valid Chapter before generating.",
@@ -428,7 +399,6 @@ export const generateQuestionPaper = async (req, res) => {
             `, [parsedChapterIds]);
             chapterRows = dbRes.rows;
         } else if (subject && subject !== 'Select') {
-            // Class Test fallback when only class + subject + title are chosen
             const dbRes = await pool.query(`
                 SELECT 
                     c.*, 
@@ -449,7 +419,6 @@ export const generateQuestionPaper = async (req, res) => {
             });
         }
 
-        // Deduplicate chapters by chapter_id in case LEFT JOIN returned multiple metadata rows
         const uniqueChaptersMap = new Map();
         for (const r of chapterRows) {
             if (!uniqueChaptersMap.has(r.chapter_id) || (!uniqueChaptersMap.get(r.chapter_id).file_url && r.file_url)) {
@@ -470,7 +439,6 @@ export const generateQuestionPaper = async (req, res) => {
             const isPdf = ch.content_format && String(ch.content_format).toLowerCase().includes('pdf');
             const pdfUrl = ch.file_url ? String(ch.file_url).trim() : null;
 
-            // Priority 1: Use content_format + sgs_file_storage_metadata PDF URL
             if ((isPdf || !textContent) && pdfUrl) {
                 try {
                     const pdfResponse = await axios.get(pdfUrl, {
@@ -490,7 +458,6 @@ export const generateQuestionPaper = async (req, res) => {
                 }
             }
 
-            // Priority 2: Fallback to text content if PDF is unavailable
             if (textContent) {
                 combinedTextPrompt += `\n--- CHAPTER: "${chName}" ---\n"""\n${textContent}\n"""\n`;
             }
@@ -508,7 +475,6 @@ export const generateQuestionPaper = async (req, res) => {
             ? `CRITICAL MULTI-CHAPTER DISTRIBUTION: You have been given ${uniqueChapters.length} chapters (${chapterNames.map((n, i) => `Chapter ${i + 1}: "${n}"`).join('; ')}). You MUST distribute questions and marks EVENLY across ALL ${uniqueChapters.length} chapters (~${Math.round(100 / uniqueChapters.length)}% weightage per chapter). Do NOT cluster questions only from the first chapter.`
             : '';
 
-        // Determine Exam Blueprint (DB -> Competitive -> Class Test -> PT Pattern)
         const matchedBlueprint = await getDynamicExamBlueprint(examType, classLevel, subject);
         let patternInstruction = "";
 
@@ -564,8 +530,8 @@ STRICT QUALITY & FORMATTING RULES:
 1. ${topicInstruction}
 2. ${multiChapterDistributionRule}
 3. ${patternInstruction}
-4. DIRECT PHRASING ONLY: Frame every question as a direct, standalone exam question. NEVER use phrases like "According to the textbook", "Based on the provided text", "In the given PDF", "As mentioned in the chapter", or "According to the passage" (unless the section itself is an Unseen/Reading Comprehension passage and you include the full passage inside the question text).
-5. COMPLETE GENERATION: Every single question in the paper MUST be fully written by you with complete question text, options (for MCQs), and a complete answer key. NEVER leave any question blank, incomplete, or with placeholders like "Not Generated by AI Yet" or "Write it myself".
+4. DIRECT PHRASING ONLY: Frame every question as a direct, standalone exam question. NEVER use phrases like "According to the textbook", "Based on the provided text", "In the given PDF", "As mentioned in the chapter", or "According to the passage".
+5. COMPLETE GENERATION: Every single question in the paper MUST be fully written by you with complete question text, options (for MCQs), and a complete answer key. NEVER leave any question blank or with placeholders like "Not Generated by AI Yet" or "Write it myself".
 6. EXACT MARKS: The sum of "marks" across all questions MUST equal ${targetMarks}.
 7. Return STRICTLY a valid JSON array of question objects. Do not wrap in markdown backticks.
 
@@ -589,9 +555,7 @@ REQUIRED JSON ARRAY SCHEMA:
         aiParts.unshift({ text: promptText });
 
         const aiResult = await model.generateContent(aiParts);
-        const rawText = typeof aiResult?.text === 'function'
-            ? aiResult.text()
-            : (aiResult?.text || aiResult?.response?.text?.() || '');
+        const rawText = extractAIText(aiResult);
 
         let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
         const jsonMatch = cleanedText.match(/\[[\s\S]*\]/);
@@ -602,11 +566,10 @@ REQUIRED JSON ARRAY SCHEMA:
 
         const parsedQuestions = JSON.parse(jsonMatch[0]);
 
-        // Normalize every question object so the frontend never shows "Not Generated by AI Yet"
         const structuredQuestions = parsedQuestions.map((q, idx) => {
             const qText = (q.question || q.questionText || q.text || '').trim()
                 .replace(/^(according to the textbook,?\s*|based on the (provided )?(text|chapter|pdf),?\s*)/i, '');
-            const formattedText = qText.charAt(0).toUpperCase() + qText.slice(1);
+            const formattedText = qText ? qText.charAt(0).toUpperCase() + qText.slice(1) : `Question ${idx + 1}`;
 
             return {
                 id: q.id || idx + 1,
@@ -647,7 +610,6 @@ REQUIRED JSON ARRAY SCHEMA:
 
     } catch (err) {
         console.error("🚨 QUESTION PAPER CRASH:", err);
-        // Return plain string error fields so frontend toast/alert never prints "[object Object]"
         res.status(500).json({
             status: "error",
             error: err.message || "Failed to generate question paper.",
@@ -663,7 +625,7 @@ REQUIRED JSON ARRAY SCHEMA:
 export const rewriteOrReplaceQuestion = async (req, res) => {
     try {
         const {
-            action = 'rewrite', // 'rewrite' | 'replace'
+            action = 'rewrite',
             question,
             questionText,
             currentQuestion,
@@ -691,17 +653,17 @@ export const rewriteOrReplaceQuestion = async (req, res) => {
             });
         }
 
-        // Optionally fetch chapter context if chapterId is supplied
         let chapterContext = "";
         if (chapterId && !isNaN(parseInt(chapterId, 10))) {
             try {
                 const chRes = await pool.query(
-                    `SELECT chapter_name, full_text_content FROM sgs_chapter_content WHERE chapter_id = $1 LIMIT 1`,
+                    `SELECT * FROM sgs_chapter_content WHERE chapter_id = $1 LIMIT 1`,
                     [parseInt(chapterId, 10)]
                 );
                 if (chRes.rows.length > 0) {
                     const ch = chRes.rows[0];
-                    chapterContext = `Chapter: "${ch.chapter_name}"\n${ch.full_text_content ? `Context:\n${ch.full_text_content.slice(0, 4000)}` : ''}`;
+                    const txt = ch.text_column || ch.full_text_content || '';
+                    chapterContext = `Chapter: "${ch.chapter_name}"\n${txt ? `Context:\n${txt.slice(0, 4000)}` : ''}`;
                 }
             } catch (_) {}
         }
@@ -737,9 +699,7 @@ CRITICAL RULES:
 `;
 
         const aiResult = await model.generateContent(prompt);
-        const rawText = typeof aiResult?.text === 'function'
-            ? aiResult.text()
-            : (aiResult?.text || aiResult?.response?.text?.() || '');
+        const rawText = extractAIText(aiResult);
 
         const cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
         const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
@@ -811,7 +771,6 @@ export const saveQuestionPaper = async (req, res) => {
             });
         }
 
-        // Ensure table exists so saving works out-of-the-box in both Staging and Production
         await pool.query(`
             CREATE TABLE IF NOT EXISTS sgs_question_papers (
                 paper_id SERIAL PRIMARY KEY,
@@ -914,9 +873,10 @@ Return {
 }
 `;
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         await logAIUsage(userInfo, "Teacher Dashboard", "Auto Answer Sheet Corrector", aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
-        let cleanedText = aiResult.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+        let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
         const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
         res.json(JSON.parse(jsonMatch[0]));
     } catch (err) {
@@ -945,16 +905,17 @@ export const generateAssignmentReminders = async (req, res) => {
         const prompt = `
 Write a professional email reminder for parents.
 Requirements:
-* Maximum 3 short paragraphs.
-* Friendly, Professional, Encouraging.
-* Mention assignment submission politely.
-* Use placeholder [Student Name] and [Assignment Name].
+- Maximum 3 short paragraphs.
+- Friendly, Professional, Encouraging.
+- Mention assignment submission politely.
+- Use placeholder [Student Name] and [Assignment Name].
 Do not use markdown. Do not use HTML. Do not use code blocks.
 `;
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         await logAIUsage(userInfo, "Teacher Dashboard", "Assignment Due Date Alerts", aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
-        res.json({ reminderEmail: aiResult.text, list: missingAssignments });
+        res.json({ reminderEmail: rawText, list: missingAssignments });
     } catch (err) {
         console.error("🚨 DUE DATE ALERTS CRASH:", err);
         res.status(500).json({ error: "Failed to generate reminders.", details: err.message });
@@ -995,10 +956,11 @@ Generate a short report. Include:
 Maximum 3 bullet points. Plain text only.
 `;
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         
         await logAIUsage(userInfo, "Teacher Dashboard", "Assignment Completion Alerts", aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
-        res.json({ completionAlert: aiResult.text, data: completions });
+        res.json({ completionAlert: rawText, data: completions });
     } catch (err) {
         console.error("🚨 COMPLETION ALERTS CRASH:", err);
         res.status(500).json({ error: "Failed to fetch completion alerts.", details: err.message });
@@ -1027,9 +989,10 @@ Formatting Rules: Create clean notes, use headings, use bullet points. No markdo
 `;
 
         const aiResult = await model.generateContent(prompt);
+        const textOut = extractAIText(aiResult);
         await logAIUsage(userInfo, "Teacher Dashboard", `Virtual Slate (${action})`, aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
-        res.json({ processedContent: aiResult.text });
+        res.json({ processedContent: textOut });
     } catch (err) {
         console.error("🚨 VIRTUAL SLATE CRASH:", err);
         res.status(500).json({ error: "Failed to process virtual slate.", details: err.message });
@@ -1094,9 +1057,10 @@ Generate: 1. Overall Performance 2. Strengths 3. Weaknesses 4. One Recommendatio
 Maximum 4 bullet points. Plain text only.
 `;
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         await logAIUsage(userInfo, "Teacher Dashboard", `Student Analytics (${subject})`, aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
-        res.json({ analysis: aiResult.text, chartData: studentData });
+        res.json({ analysis: rawText, chartData: studentData });
     } catch (err) {
         console.error("🚨 STUDENT ANALYTICS CRASH:", err);
         res.status(500).json({ error: "Failed to analyze student.", details: err.message });
@@ -1145,9 +1109,10 @@ Generate: Overall class performance, Strong performers, Students needing attenti
 Maximum 5 bullet points. Plain text only.
 `;
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         await logAIUsage(userInfo, "Teacher Dashboard", `Class Analytics (${subject})`, aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
-        res.json({ analysis: aiResult.text, chartData: classData });
+        res.json({ analysis: rawText, chartData: classData });
     } catch (err) {
         console.error("🚨 CLASS ANALYTICS CRASH:", err);
         res.status(500).json({ error: "Failed to generate class analytics.", details: err.message });
@@ -1164,8 +1129,9 @@ export const translateText = async (req, res) => {
     try {
         const prompt = `Translate the following text into ${targetLanguage}. Return ONLY the translated text. Preserve formatting. Text: "${text}"`;
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         await logAIUsage(userInfo, "Teacher Dashboard", `Language Translator`, aiResult.usageMetadata || aiResult.response?.usageMetadata);
-        res.json({ translation: aiResult.text.trim() });
+        res.json({ translation: rawText.trim() });
     } catch (err) {
         console.error("🚨 TRANSLATION CRASH:", err);
         res.status(500).json({ error: "Failed to translate text.", details: err.message });
@@ -1214,7 +1180,7 @@ IMPORTANT: Analyze the language and script of the Teacher's latest question. You
         );
 
         const aiResult = await model.generateContent(prompt);
-        const aiReply = aiResult.text;
+        const aiReply = extractAIText(aiResult);
 
         await logAIUsage(userInfo, "Teacher Dashboard", "Teacher AI Chatbot", aiResult.usageMetadata || aiResult.response?.usageMetadata);
 
@@ -1375,6 +1341,7 @@ ${classGuardrail}
         }
 
         const aiResult = await model.generateContent(prompt);
+        const rawText = extractAIText(aiResult);
         
         await logAIUsage(
             userInfo, 
@@ -1384,7 +1351,7 @@ ${classGuardrail}
         );
 
         if (isJsonExpected) {
-            let cleanedText = aiResult.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+            let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
             const jsonMatch = cleanedText.match(/\{[\s\S]*\}/);
             if (!jsonMatch) throw new Error("AI did not return a valid JSON format.");
             
@@ -1400,7 +1367,7 @@ ${classGuardrail}
             });
 
         } else {
-            return res.json({ prepMaterial: aiResult.text });
+            return res.json({ prepMaterial: rawText });
         }
 
     } catch (err) {
@@ -1408,3 +1375,4 @@ ${classGuardrail}
         res.status(500).json({ error: "Failed to generate competitive content.", details: err.message });
     }
 };
+EOF
