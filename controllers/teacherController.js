@@ -1375,4 +1375,3 @@ ${classGuardrail}
         res.status(500).json({ error: "Failed to generate competitive content.", details: err.message });
     }
 };
-EOF
