@@ -188,12 +188,12 @@ export const generateLessonPlan = async (req, res) => {
     if (!chapterId) return res.status(400).json({ error: "Chapter ID is required" });
 
     try {
-        // FIX 1: Safely query both text and PDF URL columns using a LEFT JOIN.
-        // NOTE: Adjust the ON condition (e.g., c.file_id = m.id) if your foreign key differs.
+        // FIX 1: LEFT JOIN to safely query text content (Staging) and PDF URL (Production)
         const result = await pool.query(`
             SELECT 
                 c.chapter_name, 
-                c.text_column, 
+                c.text_column,
+                c.full_text_content, 
                 c.content_format, 
                 m.file_url 
             FROM sgs_chapter_content c
@@ -203,27 +203,29 @@ export const generateLessonPlan = async (req, res) => {
 
         if (result.rows.length === 0) return res.status(404).json({ error: "Chapter not found in database" });
         
-        const { chapter_name, text_column, content_format, file_url } = result.rows[0];
+        const row = result.rows[0];
+        const chapter_name = row.chapter_name;
         const finalTopic = topic && topic.trim() !== '' ? topic : chapter_name;
+        
+        // Handle variations in column names between your environments
+        const textContent = row.text_column || row.full_text_content;
 
         let aiParts = [];
-        let textContentText = "";
+        let contentPrompt = "";
 
-        // FIX 2: Dynamically handle Text (Staging) vs PDF (Production)
-        if (text_column && text_column.trim() !== '') {
-            textContentText = `\nTEXTBOOK CONTENT:\n"""\n${text_column}\n"""\n`;
-        } else if (content_format === 'pdf' || file_url) {
-            if (!file_url) throw new Error("PDF content specified, but no file URL was found in metadata.");
-            
-            // Download the PDF from the URL and feed it to Gemini natively
-            const pdfResponse = await axios.get(file_url, { responseType: 'arraybuffer' });
+        // FIX 2: Dynamically handle Text vs PDF 
+        if (textContent && textContent.trim() !== '') {
+            contentPrompt = `\nTEXTBOOK CONTENT:\n"""\n${textContent}\n"""\n`;
+        } else if ((row.content_format === 'pdf' || row.file_url?.endsWith('.pdf')) && row.file_url) {
+            // Download the PDF and feed it to Gemini natively
+            const pdfResponse = await axios.get(row.file_url, { responseType: 'arraybuffer' });
             aiParts.push({
                 inlineData: {
                     data: Buffer.from(pdfResponse.data).toString('base64'),
                     mimeType: "application/pdf"
                 }
             });
-            textContentText = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
+            contentPrompt = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
         } else {
             return res.status(404).json({ error: "No chapter content (text or PDF) found to generate lesson plan." });
         }
@@ -231,7 +233,7 @@ export const generateLessonPlan = async (req, res) => {
         const promptText = `
 You are an expert school teacher. Create a day-wise lesson plan for the chapter "${finalTopic}".
 You have exactly ${noOfPeriods} days (periods) to complete this chapter.
-${textContentText}
+${contentPrompt}
 CRITICAL INSTRUCTIONS:
 1. Divide the chapter content logically across exactly ${noOfPeriods} days.
 2. Focus ONLY on the textbook content provided. Do not invent unrelated topics.
@@ -252,7 +254,8 @@ REQUIRED JSON STRUCTURE:
   ]
 }
 `;
-        // Pass the text prompt as the first part, followed by the PDF part (if any)
+        
+        // Pass the text prompt as the first part, followed by the PDF part (if appended)
         aiParts.unshift({ text: promptText });
 
         const aiResult = await model.generateContent(aiParts);
