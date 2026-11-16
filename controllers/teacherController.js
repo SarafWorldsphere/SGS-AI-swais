@@ -188,7 +188,7 @@ export const generateLessonPlan = async (req, res) => {
     if (!chapterId) return res.status(400).json({ error: "Chapter ID is required" });
 
     try {
-        // FIX 1: LEFT JOIN to safely query text content (Staging) and PDF URL (Production)
+        // Safe LEFT JOIN for Staging (text_column) and Production (file_url)
         const result = await pool.query(`
             SELECT 
                 c.chapter_name, 
@@ -207,17 +207,14 @@ export const generateLessonPlan = async (req, res) => {
         const chapter_name = row.chapter_name;
         const finalTopic = topic && topic.trim() !== '' ? topic : chapter_name;
         
-        // Handle variations in column names between your environments
         const textContent = row.text_column || row.full_text_content;
 
         let aiParts = [];
         let contentPrompt = "";
 
-        // FIX 2: Dynamically handle Text vs PDF 
         if (textContent && textContent.trim() !== '') {
             contentPrompt = `\nTEXTBOOK CONTENT:\n"""\n${textContent}\n"""\n`;
         } else if ((row.content_format === 'pdf' || row.file_url?.endsWith('.pdf')) && row.file_url) {
-            // Download the PDF and feed it to Gemini natively
             const pdfResponse = await axios.get(row.file_url, { responseType: 'arraybuffer' });
             aiParts.push({
                 inlineData: {
@@ -235,8 +232,7 @@ You are an expert school teacher. Create a day-wise lesson plan for the chapter 
 You have exactly ${noOfPeriods} days (periods) to complete this chapter.
 ${contentPrompt}
 CRITICAL INSTRUCTIONS:
-1. Divide the chapter content logically across exactly 
-${noOfPeriods} days.
+1. Divide the chapter content logically across exactly ${noOfPeriods} days.
 2. Focus ONLY on the textbook content provided. Do not invent unrelated topics.
 3. You MUST return ONLY a valid JSON object matching the exact structure below. Do not include markdown blocks or plain text.
 
@@ -256,7 +252,6 @@ REQUIRED JSON STRUCTURE:
 }
 `;
         
-        // Pass the text prompt as the first part, followed by the PDF part (if appended)
         aiParts.unshift({ text: promptText });
 
         const aiResult = await model.generateContent(aiParts);
