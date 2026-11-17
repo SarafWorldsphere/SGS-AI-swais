@@ -39,14 +39,26 @@ function cleanAIText(text = "") {
 }
 
 // ================================
-// Generate Content
+// Generate Content (Supports String & Multimodal Array)
 // ================================
 async function generateContent(prompt, maxRetries = 5) {
 
-    // Validate prompt
-    if (!prompt || typeof prompt !== "string") {
+    // Validate prompt: allow non-empty string OR non-empty array of parts
+    const isStringPrompt = typeof prompt === "string" && prompt.trim().length > 0;
+    const isArrayPrompt = Array.isArray(prompt) && prompt.length > 0;
+
+    if (!isStringPrompt && !isArrayPrompt) {
         throw new Error("Prompt is missing or invalid.");
     }
+
+    // Format contents for @google/genai SDK
+    const formattedContents = isArrayPrompt
+        ? [{ role: "user", parts: prompt }]
+        : prompt;
+
+    const promptLength = isStringPrompt
+        ? prompt.length
+        : prompt.reduce((acc, part) => acc + (part.text?.length || part.inlineData?.data?.length || 0), 0);
 
     let delay = 2000;
 
@@ -57,13 +69,14 @@ async function generateContent(prompt, maxRetries = 5) {
             console.log("================================");
             console.log("Gemini Request");
             console.log("Model :", process.env.GEMINI_MODEL);
-            console.log("Prompt Length :", prompt.length);
+            console.log("Input Type :", isArrayPrompt ? `Multimodal Parts (${prompt.length})` : "Text String");
+            console.log("Prompt Length :", promptLength);
             console.log("API Key Exists :", !!process.env.GEMINI_API_KEY);
             console.log("================================");
 
             const response = await ai.models.generateContent({
                 model: process.env.GEMINI_MODEL,
-                contents: prompt,
+                contents: formattedContents,
             });
 
             const text =
