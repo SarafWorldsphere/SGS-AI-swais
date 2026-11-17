@@ -1,9 +1,8 @@
-cat << 'EOF' > /home/ubuntu/swais-backend/controllers/teacherController.js
 import pool from '../config/db.js';
 import model from '../config/aiConfig.js';
 import { logAIUsage } from '../utils/aiTracker.js';
 import textToSpeech from '@google-cloud/text-to-speech';
-import axios from 'axios'; 
+import axios from 'axios';
 
 // Google Cloud TTS Client Initialize using your API KEY from .env
 const ttsClient = new textToSpeech.TextToSpeechClient({
@@ -19,23 +18,39 @@ const extractAIText = (aiResult) => {
     return '';
 };
 
+// Convert s3://bucket/key URIs into standard HTTPS S3 URLs
+const normalizeStorageUrl = (rawUrl) => {
+    if (!rawUrl) return null;
+    const trimmed = String(rawUrl).trim();
+    if (trimmed.startsWith('s3://')) {
+        const withoutProto = trimmed.slice(5);
+        const slashIdx = withoutProto.indexOf('/');
+        if (slashIdx === -1) return null;
+        const bucket = withoutProto.slice(0, slashIdx);
+        const key = withoutProto.slice(slashIdx + 1);
+        const region = process.env.AWS_REGION || 'ap-south-2';
+        return `https://${bucket}.s3.${region}.amazonaws.com/${key}`;
+    }
+    return trimmed;
+};
+
 // 🌍 Google Cloud Voice Mapping
 const googleVoiceMap = {
     "English": "en-IN",
     "Hindi": "hi-IN",
     "Telugu": "te-IN",
-    "Telegu": "te-IN", 
+    "Telegu": "te-IN",
     "Kannada": "kn-IN",
     "Tamil": "ta-IN",
     "Malayalam": "ml-IN",
     "Bengali": "bn-IN",
     "Marathi": "mr-IN",
-    "Oriya": "hi-IN", 
-    "Sanskrit": "hi-IN" 
+    "Oriya": "hi-IN",
+    "Sanskrit": "hi-IN"
 };
 
 // =========================================================================
-// 🏫 SMT. GODAVARIDEVI SARAF SENIOR SECONDARY SCHOOL - EXAM PATTERNS
+// 🏫 SMT. GODAVARIDEVI SARAF SENIOR SECONDARY SCHOOL - EXAM PATTERNS (FALLBACK)
 // =========================================================================
 const schoolExamBlueprints = {
     "PT1_PT3": {
@@ -234,12 +249,16 @@ export const generateLessonPlan = async (req, res) => {
     if (!chapterId) return res.status(400).json({ error: "Chapter ID is required" });
 
     try {
+        // Join using m.entity_id (chapter_id) OR m.file_id (content_format reference)
         const result = await pool.query(`
             SELECT 
                 c.*, 
-                m.file_url 
+                m.file_url,
+                m.file_name
             FROM sgs_chapter_content c
-            LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
+            LEFT JOIN sgs_file_storage_metadata m 
+                ON CAST(c.chapter_id AS TEXT) = CAST(m.entity_id AS TEXT)
+                OR CAST(c.content_format AS TEXT) = CAST(m.file_id AS TEXT)
             WHERE c.chapter_id = $1
             LIMIT 1
         `, [chapterId]);
@@ -247,28 +266,36 @@ export const generateLessonPlan = async (req, res) => {
         if (result.rows.length === 0) return res.status(404).json({ error: "Chapter not found in database" });
         
         const row = result.rows[0];
-        const chapter_name = row.chapter_name || "Chapter";
+        const chapter_name = row.chapter_name || row.content_title || "Chapter";
         const finalTopic = topic && topic.trim() !== '' ? topic : chapter_name;
         
         const textContent = (row.text_column || row.full_text_content || '').trim();
-        const isPdfFormat = row.content_format && String(row.content_format).toLowerCase().includes('pdf');
-        const pdfUrl = row.file_url ? String(row.file_url).trim() : null;
+        const isPdfFormat = (row.content_format && String(row.content_format).toLowerCase().includes('pdf')) || Boolean(row.file_url);
+        const pdfUrl = normalizeStorageUrl(row.file_url);
 
         let aiParts = [];
         let contentPrompt = "";
+        let pdfLoaded = false;
 
         if ((isPdfFormat || !textContent) && pdfUrl) {
-            const pdfResponse = await axios.get(pdfUrl, { responseType: 'arraybuffer', timeout: 30000 });
-            aiParts.push({
-                inlineData: {
-                    data: Buffer.from(pdfResponse.data).toString('base64'),
-                    mimeType: "application/pdf"
-                }
-            });
-            contentPrompt = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
-        } else if (textContent) {
+            try {
+                const pdfResponse = await axios.get(pdfUrl, { responseType: 'arraybuffer', timeout: 30000 });
+                aiParts.push({
+                    inlineData: {
+                        data: Buffer.from(pdfResponse.data).toString('base64'),
+                        mimeType: "application/pdf"
+                    }
+                });
+                contentPrompt = `\nTEXTBOOK CONTENT: (Please refer strictly to the attached PDF document for the chapter text).\n`;
+                pdfLoaded = true;
+            } catch (pdfErr) {
+                console.warn(`⚠️ PDF download failed (${pdfUrl}), falling back to full_text_content:`, pdfErr.message);
+            }
+        }
+
+        if (!pdfLoaded && textContent) {
             contentPrompt = `\nTEXTBOOK CONTENT:\n"""\n${textContent}\n"""\n`;
-        } else {
+        } else if (!pdfLoaded && !textContent) {
             return res.status(404).json({ error: "No chapter content (PDF in sgs_file_storage_metadata or text) found to generate lesson plan." });
         }
 
@@ -299,7 +326,8 @@ REQUIRED JSON STRUCTURE:
         
         aiParts.unshift({ text: promptText });
 
-        const aiResult = await model.generateContent(aiParts);
+        const aiInput = aiParts.length === 1 && aiParts[0].text ? aiParts[0].text : aiParts;
+        const aiResult = await model.generateContent(aiInput);
         const rawText = extractAIText(aiResult);
         
         let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -391,24 +419,31 @@ export const generateQuestionPaper = async (req, res) => {
             const dbRes = await pool.query(`
                 SELECT 
                     c.*, 
-                    m.file_url
+                    m.file_url,
+                    m.file_name
                 FROM sgs_chapter_content c
-                LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
+                LEFT JOIN sgs_file_storage_metadata m 
+                    ON CAST(c.chapter_id AS TEXT) = CAST(m.entity_id AS TEXT)
+                    OR CAST(c.content_format AS TEXT) = CAST(m.file_id AS TEXT)
                 WHERE c.chapter_id = ANY($1::int[])
                 ORDER BY c.chapter_id ASC
             `, [parsedChapterIds]);
             chapterRows = dbRes.rows;
-        } else if (subject && subject !== 'Select') {
+        } else if (title || (subject && subject !== 'Select')) {
+            const searchKey = title || subject;
             const dbRes = await pool.query(`
                 SELECT 
                     c.*, 
-                    m.file_url
+                    m.file_url,
+                    m.file_name
                 FROM sgs_chapter_content c
-                LEFT JOIN sgs_file_storage_metadata m ON c.chapter_id = m.chapter_id
-                WHERE c.subject ILIKE $1
+                LEFT JOIN sgs_file_storage_metadata m 
+                    ON CAST(c.chapter_id AS TEXT) = CAST(m.entity_id AS TEXT)
+                    OR CAST(c.content_format AS TEXT) = CAST(m.file_id AS TEXT)
+                WHERE c.chapter_name ILIKE $1 OR c.content_title ILIKE $1
                 ORDER BY c.chapter_id ASC
                 LIMIT 3
-            `, [`%${subject}%`]);
+            `, [`%${searchKey}%`]);
             chapterRows = dbRes.rows;
         }
 
@@ -432,12 +467,12 @@ export const generateQuestionPaper = async (req, res) => {
         const chapterNames = [];
 
         for (const ch of uniqueChapters) {
-            const chName = ch.chapter_name || `Chapter ${ch.chapter_id}`;
+            const chName = ch.chapter_name || ch.content_title || `Chapter ${ch.chapter_id}`;
             chapterNames.push(chName);
 
             const textContent = (ch.text_column || ch.full_text_content || '').trim();
-            const isPdf = ch.content_format && String(ch.content_format).toLowerCase().includes('pdf');
-            const pdfUrl = ch.file_url ? String(ch.file_url).trim() : null;
+            const isPdf = (ch.content_format && String(ch.content_format).toLowerCase().includes('pdf')) || Boolean(ch.file_url);
+            const pdfUrl = normalizeStorageUrl(ch.file_url);
 
             if ((isPdf || !textContent) && pdfUrl) {
                 try {
@@ -454,7 +489,7 @@ export const generateQuestionPaper = async (req, res) => {
                     combinedTextPrompt += `\n--- CHAPTER: "${chName}" (Refer to attached PDF document for "${chName}") ---\n`;
                     continue;
                 } catch (pdfErr) {
-                    console.warn(`⚠️ Failed to download PDF for chapter ${ch.chapter_id} (${pdfUrl}):`, pdfErr.message);
+                    console.warn(`⚠️ Failed to download PDF for chapter ${ch.chapter_id} (${pdfUrl}), falling back to text:`, pdfErr.message);
                 }
             }
 
@@ -554,7 +589,8 @@ REQUIRED JSON ARRAY SCHEMA:
 
         aiParts.unshift({ text: promptText });
 
-        const aiResult = await model.generateContent(aiParts);
+        const aiInput = aiParts.length === 1 && aiParts[0].text ? aiParts[0].text : aiParts;
+        const aiResult = await model.generateContent(aiInput);
         const rawText = extractAIText(aiResult);
 
         let cleanedText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
